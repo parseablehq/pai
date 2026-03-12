@@ -1,0 +1,20 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-deployment-with-init-container
+spec:
+  selector:
+    matchLabels:
+      app: my-app
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: my-app
+    spec:
+      initContainers:
+        - name: my-init-job
+          image: my-python-init-image
+      containers:
+        - name: myapp
+          image: my-python-app-image
