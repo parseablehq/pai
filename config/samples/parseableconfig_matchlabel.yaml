@@ -4,12 +4,18 @@ metadata:
   labels:
     app.kubernetes.io/name: pai
     app.kubernetes.io/managed-by: kustomize
-  name: production
+  name: production-matchlabel
 spec:
   namespaceSelector:
     mode: include
     namespaces:
       - demo
+
+  # Include only adservice (Java)
+  workloadSelector:
+    mode: include
+    matchLabels:
+      app: adservice
 
   target:
     endpoint: http://106.51.126.91:8010
@@ -18,7 +24,7 @@ spec:
       namespace: parseable-operator-system
     streams:
       logs: prod-logs
-      traces: prod-traces-demo-new
+      traces: prod-traces
       metrics: prod-metrics
 
   instrumentation:
@@ -27,30 +33,4 @@ spec:
       - python
       - nodejs
       - dotnet
-    detectionTimeout: "1m"
-
-  logs:
-    enabled: true
-    collector: otel-collector
-    enrichment:
-      kubernetesMetadata: true
-
-  nodeMetrics:
-    enabled: true
-    scrapeInterval: "15s"
-    collectors:
-      - cpu
-      - memory
-      - disk
-      - network
-
-  kubernetesEvents:
-    enabled: true
-    eventTypes:
-      - Warning
-
-  resources:
-    daemonSet:
-      limits:
-        cpu: "1"
-        memory: "1Gi"
+    detectionTimeout: "2m"

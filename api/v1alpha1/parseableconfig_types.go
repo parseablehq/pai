@@ -66,17 +66,9 @@ type TargetConfig struct {
 
 // InstrumentationConfig defines auto-instrumentation settings
 type InstrumentationConfig struct {
-	// Mode specifies the instrumentation mode
-	// +kubebuilder:validation:Enum=auto;manual;hybrid
-	Mode string `json:"mode,omitempty"`
-
 	// Languages specifies which programming languages to instrument
 	// +kubebuilder:validation:Items:Enum=java;python;nodejs;dotnet;go
 	Languages []string `json:"languages,omitempty"`
-
-	// LanguageDetection specifies how to detect application languages
-	// +kubebuilder:validation:Enum=auto;manual
-	LanguageDetection string `json:"languageDetection,omitempty"`
 
 	// DetectionTimeout is how long (e.g. "60s", "2m") to wait for spans per language attempt during auto-detection.
 	// Defaults to "1m" if not set.

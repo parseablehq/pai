@@ -410,7 +410,14 @@ func workloadKey(obj client.Object) string {
 	return fmt.Sprintf("%s/%s/%s", kind, obj.GetNamespace(), obj.GetName())
 }
 
-// isWorkloadProcessed checks if a workload was already processed at the current generation
+// isWorkloadProcessed checks if a workload should be skipped.
+// Skip if:
+//   - Already successfully instrumented (any generation) — don't redo what works
+//   - Already tried and failed at the current generation — don't retry same config
+//
+// Re-process if:
+//   - Failed (instrumented=false) at an older generation — new config might help
+//   - Not in status at all — never processed
 func isWorkloadProcessed(config *observabilityv1alpha1.ParseableConfig, obj client.Object) *observabilityv1alpha1.WorkloadInstrumentationStatus {
 	kind := "Deployment"
 	if _, ok := obj.(*appsv1.StatefulSet); ok {
@@ -419,11 +426,16 @@ func isWorkloadProcessed(config *observabilityv1alpha1.ParseableConfig, obj clie
 	for i := range config.Status.Workloads {
 		ws := &config.Status.Workloads[i]
 		if ws.Name == obj.GetName() && ws.Namespace == obj.GetNamespace() && ws.Kind == kind {
-			// Still valid if observed at current generation
+			// Successfully instrumented — always skip
+			if ws.Instrumented {
+				return ws
+			}
+			// Failed but already tried at current generation — skip
 			if ws.ObservedGeneration == config.Generation {
 				return ws
 			}
-			return nil // stale entry, needs re-processing
+			// Failed at older generation — re-process with new config
+			return nil
 		}
 	}
 	return nil
@@ -558,36 +570,15 @@ func (r *ParseableConfigReconciler) ensureAnnotations(ctx context.Context, confi
 		}
 	}
 
-	// Phase 1: Filter out already-processed workloads (using status) and inject sidecar on the rest
+	// Filter out already-processed workloads (using status)
 	var needsDetection []client.Object
-
 	for _, obj := range allWorkloads {
-		// Check status — skip if already processed at current generation
 		if ws := isWorkloadProcessed(config, obj); ws != nil {
 			logger.Info("Workload already processed, skipping",
 				"name", obj.GetName(), "namespace", obj.GetNamespace(),
 				"language", ws.DetectedLanguage, "instrumented", ws.Instrumented)
 			continue
 		}
-
-		w := r.wrapWorkload(obj)
-		annotations := w.getPodTemplateAnnotations()
-		if annotations == nil {
-			annotations = make(map[string]string)
-		}
-
-		// Add sidecar annotation if not present
-		if annotations[sidecarAnnotation] != sidecarAnnotationValue {
-			annotations[sidecarAnnotation] = sidecarAnnotationValue
-			w.setPodTemplateAnnotations(annotations)
-
-			logger.Info("Injecting sidecar annotation", "name", obj.GetName(), "namespace", obj.GetNamespace())
-			if err := r.Update(ctx, obj); err != nil {
-				logger.Error(err, "Failed to inject sidecar annotation", "name", obj.GetName(), "namespace", obj.GetNamespace())
-				continue
-			}
-		}
-
 		needsDetection = append(needsDetection, obj)
 	}
 
@@ -596,7 +587,8 @@ func (r *ParseableConfigReconciler) ensureAnnotations(ctx context.Context, confi
 		return nil
 	}
 
-	// Phase 2: Language detection for all workloads in parallel
+	// Language detection for all workloads in parallel
+	// detectLanguage sets both sidecar + language annotations in one shot (single rollout per attempt)
 	logger.Info("Starting language detection in parallel", "workloads", len(needsDetection))
 	var wg sync.WaitGroup
 	for _, obj := range needsDetection {
@@ -891,16 +883,10 @@ func (r *ParseableConfigReconciler) detectLanguage(ctx context.Context, config *
 
 		w := r.wrapWorkload(obj)
 
-		// Wait for rollout
-		if err := r.waitForRollout(ctx, w, existingPods); err != nil {
-			logger.Error(err, "Rollout wait failed", "name", obj.GetName(), "language", lang)
-			continue
-		}
-
-		// Find the new pod
-		podName, err := r.findNewRunningPod(ctx, w, existingPods)
+		// Wait for rollout and get pod name
+		podName, err := r.waitForRollout(ctx, w, existingPods)
 		if err != nil {
-			logger.Error(err, "Failed to find running pod", "name", obj.GetName(), "language", lang)
+			logger.Error(err, "Rollout wait failed", "name", obj.GetName(), "language", lang)
 			continue
 		}
 
@@ -983,16 +969,18 @@ func (r *ParseableConfigReconciler) wrapWorkload(obj client.Object) workload {
 	return nil
 }
 
-// waitForRollout waits for a NEW pod (not in oldPods) to be ready with the sidecar
-func (r *ParseableConfigReconciler) waitForRollout(ctx context.Context, w workload, oldPods map[string]bool) error {
-	timeout := time.After(2 * time.Minute)
+// waitForRollout waits for a NEW pod (not in oldPods) to be running with the sidecar
+// and returns the pod name. Does not require the pod to be fully ready —
+// the detection polling loop handles readiness via metrics checks.
+func (r *ParseableConfigReconciler) waitForRollout(ctx context.Context, w workload, oldPods map[string]bool) (string, error) {
+	timeout := time.After(5 * time.Minute)
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-timeout:
-			return fmt.Errorf("timed out waiting for rollout of %s/%s", w.GetNamespace(), w.GetName())
+			return "", fmt.Errorf("timed out waiting for rollout of %s/%s", w.GetNamespace(), w.GetName())
 		case <-ticker.C:
 			podList := &corev1.PodList{}
 			if err := r.List(ctx, podList, client.InNamespace(w.GetNamespace()), client.MatchingLabelsSelector{Selector: w.getPodSelector()}); err != nil {
@@ -1002,12 +990,12 @@ func (r *ParseableConfigReconciler) waitForRollout(ctx context.Context, w worklo
 				if pod.DeletionTimestamp != nil || oldPods[pod.Name] {
 					continue
 				}
-				if pod.Status.Phase == corev1.PodRunning && isPodReady(&pod) && hasSidecarInitContainer(&pod) {
-					return nil
+				if pod.Status.Phase == corev1.PodRunning && hasSidecarInitContainer(&pod) {
+					return pod.Name, nil
 				}
 			}
 		case <-ctx.Done():
-			return ctx.Err()
+			return "", ctx.Err()
 		}
 	}
 }
@@ -1045,24 +1033,6 @@ func (r *ParseableConfigReconciler) getExistingPodNames(ctx context.Context, w w
 	return names
 }
 
-// findNewRunningPod finds a running pod that is NOT in the oldPods set
-func (r *ParseableConfigReconciler) findNewRunningPod(ctx context.Context, w workload, oldPods map[string]bool) (string, error) {
-	podList := &corev1.PodList{}
-	if err := r.List(ctx, podList, client.InNamespace(w.GetNamespace()), client.MatchingLabelsSelector{Selector: w.getPodSelector()}); err != nil {
-		return "", err
-	}
-
-	for _, pod := range podList.Items {
-		if oldPods[pod.Name] || pod.DeletionTimestamp != nil {
-			continue
-		}
-		if pod.Status.Phase == corev1.PodRunning && isPodReady(&pod) {
-			return pod.Name, nil
-		}
-	}
-
-	return "", fmt.Errorf("no new running pod found for %s/%s", w.GetNamespace(), w.GetName())
-}
 
 // fetchSidecarMetrics fetches metrics from the sidecar's /metrics endpoint
 // Uses the Kubernetes pod proxy API which works both locally and in-cluster

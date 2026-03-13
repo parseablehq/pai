@@ -47,26 +47,12 @@ spec:
                       DetectionTimeout is how long (e.g. "60s", "2m") to wait for spans per language attempt during auto-detection.
                       Defaults to "1m" if not set.
                     type: string
-                  languageDetection:
-                    description: LanguageDetection specifies how to detect application
-                      languages
-                    enum:
-                    - auto
-                    - manual
-                    type: string
                   languages:
                     description: Languages specifies which programming languages to
                       instrument
                     items:
                       type: string
                     type: array
-                  mode:
-                    description: Mode specifies the instrumentation mode
-                    enum:
-                    - auto
-                    - manual
-                    - hybrid
-                    type: string
                 type: object
               kubernetesEvents:
                 description: KubernetesEvents defines Kubernetes event collection
