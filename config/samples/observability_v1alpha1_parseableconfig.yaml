@@ -9,7 +9,7 @@ spec:
   namespaceSelector:
     mode: include
     namespaces:
-      - default
+      - demo
 
   target:
     endpoint: http://106.51.126.91:8010
@@ -27,7 +27,9 @@ spec:
       - java
       - python
       - nodejs
+      - dotnet
     languageDetection: auto
+    detectionTimeout: "2m"
 
   logs:
     enabled: true

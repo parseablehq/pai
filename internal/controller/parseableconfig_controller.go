@@ -21,11 +21,13 @@ import (
 	"encoding/base64"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -55,9 +57,9 @@ const (
 	instrumentationAnnotPrefix = "instrumentation.opentelemetry.io/inject-"
 	instrumentationRefValue    = otelOperatorNamespace + "/" + instrumentationName
 
-	sidecarMetricsPort   = "8888"
-	metricsCheckMetric   = "otelcol_receiver_accepted_spans_total"
-	metricsCheckWaitTime = 30 * time.Second
+	sidecarMetricsPort         = "8888"
+	metricsCheckMetric         = "otelcol_receiver_accepted_spans_total"
+	defaultDetectionTimeout    = 1 * time.Minute
 
 	finalizerName = "observability.parseable.com/finalizer"
 )
@@ -68,6 +70,7 @@ var languageImages = map[string]string{
 	"java":   "ghcr.io/open-telemetry/opentelemetry-operator/autoinstrumentation-java:latest",
 	"python": "ghcr.io/open-telemetry/opentelemetry-operator/autoinstrumentation-python:latest",
 	"nodejs": "ghcr.io/open-telemetry/opentelemetry-operator/autoinstrumentation-nodejs:latest",
+	"dotnet": "ghcr.io/open-telemetry/opentelemetry-operator/autoinstrumentation-dotnet:latest",
 }
 
 // ParseableConfigReconciler reconciles a ParseableConfig object
@@ -318,33 +321,8 @@ func (r *ParseableConfigReconciler) ensureSidecarCollector(ctx context.Context, 
 	return nil
 }
 
-// ensureInstrumentation creates the Instrumentation CR with language sections based on the ParseableConfig
-func (r *ParseableConfigReconciler) ensureInstrumentation(ctx context.Context, config *observabilityv1alpha1.ParseableConfig) error {
-	logger := log.FromContext(ctx)
-
-	existing := &unstructured.Unstructured{}
-	existing.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "opentelemetry.io",
-		Version: "v1alpha1",
-		Kind:    "Instrumentation",
-	})
-
-	err := r.Get(ctx, client.ObjectKey{Name: instrumentationName, Namespace: otelOperatorNamespace}, existing)
-	if err == nil {
-		logger.Info("Instrumentation CR already exists, skipping")
-		return nil
-	}
-	if !errors.IsNotFound(err) {
-		return fmt.Errorf("failed to check Instrumentation CR: %w", err)
-	}
-
-	if len(config.Spec.Instrumentation.Languages) == 0 {
-		logger.Info("No languages configured, skipping Instrumentation CR creation")
-		return nil
-	}
-
-	logger.Info("Creating Instrumentation CR", "languages", config.Spec.Instrumentation.Languages)
-
+// buildInstrumentationSpec builds the Instrumentation spec from the ParseableConfig
+func (r *ParseableConfigReconciler) buildInstrumentationSpec(config *observabilityv1alpha1.ParseableConfig) map[string]interface{} {
 	spec := map[string]interface{}{
 		"exporter": map[string]interface{}{
 			"endpoint": "http://localhost:4318",
@@ -355,11 +333,9 @@ func (r *ParseableConfigReconciler) ensureInstrumentation(ctx context.Context, c
 		},
 	}
 
-	// Add language sections only for configured languages
 	for _, lang := range config.Spec.Instrumentation.Languages {
 		image, ok := languageImages[lang]
 		if !ok {
-			logger.Info("Unknown language, skipping", "language", lang)
 			continue
 		}
 		spec[lang] = map[string]interface{}{
@@ -367,6 +343,44 @@ func (r *ParseableConfigReconciler) ensureInstrumentation(ctx context.Context, c
 		}
 	}
 
+	return spec
+}
+
+// ensureInstrumentation creates or updates the Instrumentation CR with language sections based on the ParseableConfig
+func (r *ParseableConfigReconciler) ensureInstrumentation(ctx context.Context, config *observabilityv1alpha1.ParseableConfig) error {
+	logger := log.FromContext(ctx)
+
+	if len(config.Spec.Instrumentation.Languages) == 0 {
+		logger.Info("No languages configured, skipping Instrumentation CR")
+		return nil
+	}
+
+	existing := &unstructured.Unstructured{}
+	existing.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "opentelemetry.io",
+		Version: "v1alpha1",
+		Kind:    "Instrumentation",
+	})
+
+	err := r.Get(ctx, client.ObjectKey{Name: instrumentationName, Namespace: otelOperatorNamespace}, existing)
+	if err != nil && !errors.IsNotFound(err) {
+		return fmt.Errorf("failed to check Instrumentation CR: %w", err)
+	}
+
+	spec := r.buildInstrumentationSpec(config)
+
+	if err == nil {
+		// Update existing CR with current languages
+		existing.Object["spec"] = spec
+		if err := r.Update(ctx, existing); err != nil {
+			return fmt.Errorf("failed to update Instrumentation CR: %w", err)
+		}
+		logger.Info("Instrumentation CR updated", "languages", config.Spec.Instrumentation.Languages)
+		return nil
+	}
+
+	// Create new
+	logger.Info("Creating Instrumentation CR", "languages", config.Spec.Instrumentation.Languages)
 	instrumentation := &unstructured.Unstructured{
 		Object: map[string]interface{}{
 			"apiVersion": "opentelemetry.io/v1alpha1",
@@ -387,10 +401,88 @@ func (r *ParseableConfigReconciler) ensureInstrumentation(ctx context.Context, c
 	return nil
 }
 
+// workloadKey returns a unique key for a workload (kind/namespace/name)
+func workloadKey(obj client.Object) string {
+	kind := "Deployment"
+	if _, ok := obj.(*appsv1.StatefulSet); ok {
+		kind = "StatefulSet"
+	}
+	return fmt.Sprintf("%s/%s/%s", kind, obj.GetNamespace(), obj.GetName())
+}
+
+// isWorkloadProcessed checks if a workload was already processed at the current generation
+func isWorkloadProcessed(config *observabilityv1alpha1.ParseableConfig, obj client.Object) *observabilityv1alpha1.WorkloadInstrumentationStatus {
+	kind := "Deployment"
+	if _, ok := obj.(*appsv1.StatefulSet); ok {
+		kind = "StatefulSet"
+	}
+	for i := range config.Status.Workloads {
+		ws := &config.Status.Workloads[i]
+		if ws.Name == obj.GetName() && ws.Namespace == obj.GetNamespace() && ws.Kind == kind {
+			// Still valid if observed at current generation
+			if ws.ObservedGeneration == config.Generation {
+				return ws
+			}
+			return nil // stale entry, needs re-processing
+		}
+	}
+	return nil
+}
+
+// updateWorkloadStatus updates or adds a workload's status entry and persists it
+func (r *ParseableConfigReconciler) updateWorkloadStatus(ctx context.Context, config *observabilityv1alpha1.ParseableConfig, obj client.Object, lang string, instrumented bool) {
+	logger := log.FromContext(ctx)
+
+	kind := "Deployment"
+	if _, ok := obj.(*appsv1.StatefulSet); ok {
+		kind = "StatefulSet"
+	}
+
+	now := metav1.Now()
+	entry := observabilityv1alpha1.WorkloadInstrumentationStatus{
+		Name:               obj.GetName(),
+		Namespace:          obj.GetNamespace(),
+		Kind:               kind,
+		DetectedLanguage:   lang,
+		Instrumented:       instrumented,
+		LastDetectionTime:  &now,
+		ObservedGeneration: config.Generation,
+	}
+
+	// Re-fetch config to get latest status before updating
+	fresh := &observabilityv1alpha1.ParseableConfig{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(config), fresh); err != nil {
+		logger.Error(err, "Failed to fetch config for status update")
+		return
+	}
+
+	// Find and update existing entry, or append
+	found := false
+	for i := range fresh.Status.Workloads {
+		if fresh.Status.Workloads[i].Name == entry.Name &&
+			fresh.Status.Workloads[i].Namespace == entry.Namespace &&
+			fresh.Status.Workloads[i].Kind == entry.Kind {
+			fresh.Status.Workloads[i] = entry
+			found = true
+			break
+		}
+	}
+	if !found {
+		fresh.Status.Workloads = append(fresh.Status.Workloads, entry)
+	}
+
+	if err := r.Status().Update(ctx, fresh); err != nil {
+		logger.Error(err, "Failed to update workload status", "workload", workloadKey(obj))
+	} else {
+		logger.Info("Workload status updated", "workload", workloadKey(obj), "language", lang, "instrumented", instrumented)
+	}
+}
+
 // ensureAnnotations works in two phases:
 // Phase 1: Inject sidecar annotation on ALL workloads at once
 // Phase 2: For each workload, try language annotations one by one (hit-and-trial)
 // If no language matches, remove sidecar annotation to revert to original state
+// Workloads already processed (tracked in status) at current generation are skipped.
 func (r *ParseableConfigReconciler) ensureAnnotations(ctx context.Context, config *observabilityv1alpha1.ParseableConfig) error {
 	logger := log.FromContext(ctx)
 
@@ -432,38 +524,62 @@ func (r *ParseableConfigReconciler) ensureAnnotations(ctx context.Context, confi
 		return nil
 	}
 
-	// Phase 1: Inject sidecar annotation on all workloads that don't already have a detected language
+	// Apply workload selector filter
+	if config.Spec.WorkloadSelector != nil {
+		selector, err := metav1.LabelSelectorAsSelector(&config.Spec.WorkloadSelector.LabelSelector)
+		if err != nil {
+			return fmt.Errorf("invalid workloadSelector: %w", err)
+		}
+
+		var filtered []client.Object
+		for _, obj := range allWorkloads {
+			matches := selector.Matches(labels.Set(obj.GetLabels()))
+			switch config.Spec.WorkloadSelector.Mode {
+			case "include":
+				if matches {
+					filtered = append(filtered, obj)
+				} else {
+					logger.Info("Workload excluded by workloadSelector (include mode)", "name", obj.GetName(), "namespace", obj.GetNamespace())
+				}
+			case "exclude":
+				if !matches {
+					filtered = append(filtered, obj)
+				} else {
+					logger.Info("Workload excluded by workloadSelector (exclude mode)", "name", obj.GetName(), "namespace", obj.GetNamespace())
+				}
+			default:
+				filtered = append(filtered, obj)
+			}
+		}
+		allWorkloads = filtered
+		if len(allWorkloads) == 0 {
+			logger.Info("No workloads matched workloadSelector")
+			return nil
+		}
+	}
+
+	// Phase 1: Filter out already-processed workloads (using status) and inject sidecar on the rest
 	var needsDetection []client.Object
-	oldPodsMap := make(map[string]map[string]bool) // workload key -> old pod names
 
 	for _, obj := range allWorkloads {
+		// Check status — skip if already processed at current generation
+		if ws := isWorkloadProcessed(config, obj); ws != nil {
+			logger.Info("Workload already processed, skipping",
+				"name", obj.GetName(), "namespace", obj.GetNamespace(),
+				"language", ws.DetectedLanguage, "instrumented", ws.Instrumented)
+			continue
+		}
+
 		w := r.wrapWorkload(obj)
 		annotations := w.getPodTemplateAnnotations()
 		if annotations == nil {
 			annotations = make(map[string]string)
 		}
 
-		// Skip if already has a detected language + sidecar
-		alreadyDetected := false
-		for _, lang := range config.Spec.Instrumentation.Languages {
-			if annotations[instrumentationAnnotPrefix+lang] == instrumentationRefValue &&
-				annotations[sidecarAnnotation] == sidecarAnnotationValue {
-				logger.Info("Workload already annotated", "name", obj.GetName(), "namespace", obj.GetNamespace(), "language", lang)
-				alreadyDetected = true
-				break
-			}
-		}
-		if alreadyDetected {
-			continue
-		}
-
 		// Add sidecar annotation if not present
 		if annotations[sidecarAnnotation] != sidecarAnnotationValue {
 			annotations[sidecarAnnotation] = sidecarAnnotationValue
 			w.setPodTemplateAnnotations(annotations)
-
-			key := obj.GetNamespace() + "/" + obj.GetName()
-			oldPodsMap[key] = r.getExistingPodNames(ctx, w)
 
 			logger.Info("Injecting sidecar annotation", "name", obj.GetName(), "namespace", obj.GetNamespace())
 			if err := r.Update(ctx, obj); err != nil {
@@ -476,38 +592,23 @@ func (r *ParseableConfigReconciler) ensureAnnotations(ctx context.Context, confi
 	}
 
 	if len(needsDetection) == 0 {
-		logger.Info("All workloads already annotated, nothing to detect")
+		logger.Info("All workloads already processed, nothing to detect")
 		return nil
 	}
 
-	// Wait for all sidecar rollouts to complete
-	logger.Info("Waiting for sidecar rollouts to complete", "count", len(needsDetection))
+	// Phase 2: Language detection for all workloads in parallel
+	logger.Info("Starting language detection in parallel", "workloads", len(needsDetection))
+	var wg sync.WaitGroup
 	for _, obj := range needsDetection {
-		key := obj.GetNamespace() + "/" + obj.GetName()
-		// Re-fetch to get latest state
-		if err := r.Get(ctx, client.ObjectKeyFromObject(obj), obj); err != nil {
-			logger.Error(err, "Failed to re-fetch workload for rollout wait", "name", obj.GetName())
-			continue
-		}
-		w := r.wrapWorkload(obj)
-		oldPods := oldPodsMap[key]
-		if oldPods == nil {
-			oldPods = make(map[string]bool)
-		}
-		if err := r.waitForRollout(ctx, w, oldPods); err != nil {
-			logger.Error(err, "Sidecar rollout failed", "name", obj.GetName(), "namespace", obj.GetNamespace())
-		} else {
-			logger.Info("Sidecar rollout complete", "name", obj.GetName(), "namespace", obj.GetNamespace())
-		}
+		wg.Add(1)
+		go func(o client.Object) {
+			defer wg.Done()
+			if err := r.detectLanguage(ctx, config, o); err != nil {
+				logger.Error(err, "Language detection failed", "name", o.GetName(), "namespace", o.GetNamespace())
+			}
+		}(obj)
 	}
-
-	// Phase 2: Language detection for each workload
-	logger.Info("Starting language detection", "workloads", len(needsDetection))
-	for _, obj := range needsDetection {
-		if err := r.detectLanguage(ctx, config, obj); err != nil {
-			logger.Error(err, "Language detection failed", "name", obj.GetName(), "namespace", obj.GetNamespace())
-		}
-	}
+	wg.Wait()
 
 	return nil
 }
@@ -515,6 +616,13 @@ func (r *ParseableConfigReconciler) ensureAnnotations(ctx context.Context, confi
 // cleanup removes all resources created by the operator in reverse order
 func (r *ParseableConfigReconciler) cleanup(ctx context.Context, config *observabilityv1alpha1.ParseableConfig) error {
 	logger := log.FromContext(ctx)
+
+	// Step 0: Clear workload status
+	logger.Info("Clearing workload status")
+	config.Status.Workloads = nil
+	if err := r.Status().Update(ctx, config); err != nil {
+		logger.Error(err, "Failed to clear workload status")
+	}
 
 	// Step 1: Remove annotations from all workloads
 	logger.Info("Removing annotations from workloads")
@@ -726,41 +834,62 @@ func (s *statefulSetWorkload) getPodSelector() labels.Selector {
 }
 
 // detectLanguage tries language annotations one by one on a workload that already has a sidecar.
-// For each language, it adds the annotation, waits for rollout, and checks sidecar metrics.
-// If no language matches, it removes the sidecar annotation to revert to original state.
+// For each language, it adds the annotation, waits for rollout, and polls sidecar metrics
+// for the configured detectionTimeout. If no language matches, it removes the sidecar annotation.
 func (r *ParseableConfigReconciler) detectLanguage(ctx context.Context, config *observabilityv1alpha1.ParseableConfig, obj client.Object) error {
 	logger := log.FromContext(ctx)
+
+	detectionTimeout := defaultDetectionTimeout
+	if config.Spec.Instrumentation.DetectionTimeout != "" {
+		if parsed, err := time.ParseDuration(config.Spec.Instrumentation.DetectionTimeout); err == nil {
+			detectionTimeout = parsed
+		} else {
+			logger.Error(err, "Invalid detectionTimeout, using default", "value", config.Spec.Instrumentation.DetectionTimeout)
+		}
+	}
 
 	for _, lang := range config.Spec.Instrumentation.Languages {
 		key := instrumentationAnnotPrefix + lang
 
-		// Re-fetch to avoid conflicts
-		if err := r.Get(ctx, client.ObjectKeyFromObject(obj), obj); err != nil {
-			return fmt.Errorf("failed to re-fetch workload: %w", err)
-		}
-		w := r.wrapWorkload(obj)
-		annotations := w.getPodTemplateAnnotations()
-		if annotations == nil {
-			annotations = make(map[string]string)
-		}
-
-		// Remove any previous language annotations
-		for _, l := range config.Spec.Instrumentation.Languages {
-			delete(annotations, instrumentationAnnotPrefix+l)
-		}
-
-		// Set this language annotation (keep sidecar)
-		annotations[sidecarAnnotation] = sidecarAnnotationValue
-		annotations[key] = instrumentationRefValue
-		w.setPodTemplateAnnotations(annotations)
-
 		logger.Info("Trying language annotation", "name", obj.GetName(), "namespace", obj.GetNamespace(), "language", lang)
 
-		existingPods := r.getExistingPodNames(ctx, w)
+		// Retry on conflict since multiple goroutines may be updating concurrently
+		var existingPods map[string]bool
+		var updateErr error
+		for retry := 0; retry < 5; retry++ {
+			if err := r.Get(ctx, client.ObjectKeyFromObject(obj), obj); err != nil {
+				return fmt.Errorf("failed to re-fetch workload: %w", err)
+			}
+			w := r.wrapWorkload(obj)
+			annotations := w.getPodTemplateAnnotations()
+			if annotations == nil {
+				annotations = make(map[string]string)
+			}
 
-		if err := r.Update(ctx, obj); err != nil {
-			return fmt.Errorf("failed to update workload %s/%s with language %s: %w", obj.GetNamespace(), obj.GetName(), lang, err)
+			for _, l := range config.Spec.Instrumentation.Languages {
+				delete(annotations, instrumentationAnnotPrefix+l)
+			}
+			annotations[sidecarAnnotation] = sidecarAnnotationValue
+			annotations[key] = instrumentationRefValue
+			w.setPodTemplateAnnotations(annotations)
+
+			existingPods = r.getExistingPodNames(ctx, w)
+			updateErr = r.Update(ctx, obj)
+			if updateErr == nil {
+				break
+			}
+			if errors.IsConflict(updateErr) {
+				logger.Info("Conflict on update, retrying", "name", obj.GetName(), "language", lang, "retry", retry+1)
+				time.Sleep(time.Duration(retry+1) * time.Second)
+				continue
+			}
+			return fmt.Errorf("failed to update workload %s/%s with language %s: %w", obj.GetNamespace(), obj.GetName(), lang, updateErr)
 		}
+		if updateErr != nil {
+			return fmt.Errorf("failed to update workload %s/%s with language %s after retries: %w", obj.GetNamespace(), obj.GetName(), lang, updateErr)
+		}
+
+		w := r.wrapWorkload(obj)
 
 		// Wait for rollout
 		if err := r.waitForRollout(ctx, w, existingPods); err != nil {
@@ -775,18 +904,37 @@ func (r *ParseableConfigReconciler) detectLanguage(ctx context.Context, config *
 			continue
 		}
 
-		// Wait and check metrics
-		logger.Info("Waiting for spans", "pod", podName, "namespace", obj.GetNamespace(), "language", lang)
-		time.Sleep(metricsCheckWaitTime)
+		// Poll sidecar metrics for detectionTimeout, checking every 10s
+		logger.Info("Waiting for spans", "pod", podName, "namespace", obj.GetNamespace(), "language", lang, "timeout", detectionTimeout)
+		deadline := time.After(detectionTimeout)
+		ticker := time.NewTicker(10 * time.Second)
+		detected := false
 
-		metrics, err := r.fetchSidecarMetrics(ctx, podName, obj.GetNamespace())
-		if err != nil {
-			logger.Error(err, "Failed to fetch sidecar metrics", "pod", podName, "language", lang)
-			continue
-		}
+		func() {
+			defer ticker.Stop()
+			for {
+				select {
+				case <-deadline:
+					return
+				case <-ticker.C:
+					metrics, err := r.fetchSidecarMetrics(ctx, podName, obj.GetNamespace())
+					if err != nil {
+						logger.Error(err, "Failed to fetch sidecar metrics", "pod", podName, "language", lang)
+						continue
+					}
+					if checkSidecarHasSpans(metrics) {
+						detected = true
+						return
+					}
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
 
-		if checkSidecarHasSpans(metrics) {
+		if detected {
 			logger.Info("Language detected", "name", obj.GetName(), "namespace", obj.GetNamespace(), "language", lang)
+			r.updateWorkloadStatus(ctx, config, obj, lang, true)
 			return nil
 		}
 
@@ -795,24 +943,33 @@ func (r *ParseableConfigReconciler) detectLanguage(ctx context.Context, config *
 
 	// No language matched — remove sidecar annotation to revert to original
 	logger.Info("No language matched, reverting to original state", "name", obj.GetName(), "namespace", obj.GetNamespace())
-	if err := r.Get(ctx, client.ObjectKeyFromObject(obj), obj); err != nil {
-		return err
-	}
-	w := r.wrapWorkload(obj)
-	annotations := w.getPodTemplateAnnotations()
-	if annotations == nil {
-		return nil
-	}
-	delete(annotations, sidecarAnnotation)
-	for _, lang := range config.Spec.Instrumentation.Languages {
-		delete(annotations, instrumentationAnnotPrefix+lang)
-	}
-	w.setPodTemplateAnnotations(annotations)
-	if err := r.Update(ctx, obj); err != nil {
+	r.updateWorkloadStatus(ctx, config, obj, "", false)
+	for retry := 0; retry < 5; retry++ {
+		if err := r.Get(ctx, client.ObjectKeyFromObject(obj), obj); err != nil {
+			return err
+		}
+		rw := r.wrapWorkload(obj)
+		annotations := rw.getPodTemplateAnnotations()
+		if annotations == nil {
+			return nil
+		}
+		delete(annotations, sidecarAnnotation)
+		for _, lang := range config.Spec.Instrumentation.Languages {
+			delete(annotations, instrumentationAnnotPrefix+lang)
+		}
+		rw.setPodTemplateAnnotations(annotations)
+		err := r.Update(ctx, obj)
+		if err == nil {
+			logger.Info("Workload reverted to original state", "name", obj.GetName(), "namespace", obj.GetNamespace())
+			return nil
+		}
+		if errors.IsConflict(err) {
+			time.Sleep(time.Duration(retry+1) * time.Second)
+			continue
+		}
 		return fmt.Errorf("failed to revert workload to original: %w", err)
 	}
-	logger.Info("Workload reverted to original state", "name", obj.GetName(), "namespace", obj.GetNamespace())
-	return nil
+	return fmt.Errorf("failed to revert workload %s/%s after retries", obj.GetNamespace(), obj.GetName())
 }
 
 // wrapWorkload wraps a client.Object into the workload interface

@@ -71,12 +71,16 @@ type InstrumentationConfig struct {
 	Mode string `json:"mode,omitempty"`
 
 	// Languages specifies which programming languages to instrument
-	// +kubebuilder:validation:Items:Enum=java;python;nodejs;go
+	// +kubebuilder:validation:Items:Enum=java;python;nodejs;dotnet;go
 	Languages []string `json:"languages,omitempty"`
 
 	// LanguageDetection specifies how to detect application languages
 	// +kubebuilder:validation:Enum=auto;manual
 	LanguageDetection string `json:"languageDetection,omitempty"`
+
+	// DetectionTimeout is how long (e.g. "60s", "2m") to wait for spans per language attempt during auto-detection.
+	// Defaults to "1m" if not set.
+	DetectionTimeout string `json:"detectionTimeout,omitempty"`
 }
 
 // LogEnrichment defines log enrichment options
@@ -132,10 +136,26 @@ type ResourcesConfig struct {
 	DaemonSet DaemonSetResources `json:"daemonSet,omitempty"`
 }
 
+// WorkloadSelector defines which workloads to include or exclude by labels
+type WorkloadSelector struct {
+	// Mode specifies whether to include or exclude workloads matching the selector
+	// +kubebuilder:validation:Enum=include;exclude
+	Mode string `json:"mode,omitempty"`
+
+	// LabelSelector is a standard Kubernetes label selector supporting matchLabels and matchExpressions
+	metav1.LabelSelector `json:",inline"`
+}
+
 // ParseableConfigSpec defines the desired state of ParseableConfig
 type ParseableConfigSpec struct {
 	// NamespaceSelector defines which namespaces to include or exclude from instrumentation
 	NamespaceSelector NamespaceSelector `json:"namespaceSelector,omitempty"`
+
+	// WorkloadSelector defines which workloads to include or exclude by labels.
+	// In "include" mode, only workloads with ALL matching labels are instrumented.
+	// In "exclude" mode, workloads with ALL matching labels are skipped.
+	// If not set, all workloads in selected namespaces are instrumented.
+	WorkloadSelector *WorkloadSelector `json:"workloadSelector,omitempty"`
 
 	// Target defines the Parseable endpoint configuration
 	Target TargetConfig `json:"target"`
@@ -156,10 +176,37 @@ type ParseableConfigSpec struct {
 	Resources ResourcesConfig `json:"resources,omitempty"`
 }
 
+// WorkloadInstrumentationStatus tracks the detection result for a single workload
+type WorkloadInstrumentationStatus struct {
+	// Name of the workload
+	Name string `json:"name"`
+
+	// Namespace of the workload
+	Namespace string `json:"namespace"`
+
+	// Kind is Deployment or StatefulSet
+	Kind string `json:"kind"`
+
+	// DetectedLanguage is the language that was detected (empty if none matched)
+	DetectedLanguage string `json:"detectedLanguage,omitempty"`
+
+	// Instrumented indicates whether the workload was successfully instrumented
+	Instrumented bool `json:"instrumented"`
+
+	// LastDetectionTime is when detection was last performed
+	LastDetectionTime *metav1.Time `json:"lastDetectionTime,omitempty"`
+
+	// ObservedGeneration is the CR generation when this workload was last processed
+	ObservedGeneration int64 `json:"observedGeneration"`
+}
+
 // ParseableConfigStatus defines the observed state of ParseableConfig
 type ParseableConfigStatus struct {
 	// Conditions represent the latest available observations of the resource's state
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	// Workloads tracks the instrumentation status of each processed workload
+	Workloads []WorkloadInstrumentationStatus `json:"workloads,omitempty"`
 }
 
 // +kubebuilder:object:root=true
