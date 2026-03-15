@@ -210,8 +210,33 @@ func (r *ParseableConfigReconciler) ensureOtelOperator(ctx context.Context) erro
 		return fmt.Errorf("failed to install otel operator: %w", err)
 	}
 
-	logger.Info("OpenTelemetry operator installed successfully", "release", otelOperatorRelease, "namespace", otelOperatorNamespace)
-	return nil
+	logger.Info("OpenTelemetry operator installed successfully, waiting for webhook readiness", "release", otelOperatorRelease, "namespace", otelOperatorNamespace)
+
+	// Wait for the OTel operator deployment to be ready (webhook must be serving before we annotate workloads)
+	timeout := time.After(3 * time.Minute)
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-timeout:
+			return fmt.Errorf("timed out waiting for otel operator to be ready")
+		case <-ticker.C:
+			deploy := &appsv1.Deployment{}
+			if err := r.Get(ctx, client.ObjectKey{Name: "opentelemetry-operator", Namespace: otelOperatorNamespace}, deploy); err != nil {
+				logger.Info("Waiting for otel operator deployment...", "error", err.Error())
+				continue
+			}
+			if deploy.Status.ReadyReplicas > 0 && deploy.Status.ReadyReplicas == deploy.Status.Replicas {
+				logger.Info("OpenTelemetry operator is ready")
+				// Give webhook a few more seconds to register
+				time.Sleep(10 * time.Second)
+				return nil
+			}
+			logger.Info("Waiting for otel operator to be ready", "readyReplicas", deploy.Status.ReadyReplicas, "replicas", deploy.Status.Replicas)
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 }
 
 // ensureSidecarCollector creates the OpenTelemetryCollector sidecar CR if it does not exist
