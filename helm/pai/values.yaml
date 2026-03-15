@@ -1,0 +1,26 @@
+replicaCount: 1
+
+image:
+  repository: parseable/pai
+  tag: ""  # defaults to appVersion
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  name: ""
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 128Mi
+  requests:
+    cpu: 10m
+    memory: 64Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

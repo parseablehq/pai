@@ -17,9 +17,7 @@ spec:
       name: parseable-creds
       namespace: parseable-operator-system
     streams:
-      logs: prod-logs
       traces: prod-traces-demo-new
-      metrics: prod-metrics
 
   instrumentation:
     languages:
@@ -28,29 +26,3 @@ spec:
       - nodejs
       - dotnet
     detectionTimeout: "1m"
-
-  logs:
-    enabled: true
-    collector: otel-collector
-    enrichment:
-      kubernetesMetadata: true
-
-  nodeMetrics:
-    enabled: true
-    scrapeInterval: "15s"
-    collectors:
-      - cpu
-      - memory
-      - disk
-      - network
-
-  kubernetesEvents:
-    enabled: true
-    eventTypes:
-      - Warning
-
-  resources:
-    daemonSet:
-      limits:
-        cpu: "1"
-        memory: "1Gi"

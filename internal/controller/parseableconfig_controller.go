@@ -490,10 +490,10 @@ func (r *ParseableConfigReconciler) updateWorkloadStatus(ctx context.Context, co
 	}
 }
 
-// ensureAnnotations works in two phases:
-// Phase 1: Inject sidecar annotation on ALL workloads at once
-// Phase 2: For each workload, try language annotations one by one (hit-and-trial)
-// If no language matches, remove sidecar annotation to revert to original state
+// ensureAnnotations filters workloads by selector and status, then runs
+// detectLanguage in parallel for each unprocessed workload.
+// detectLanguage sets both sidecar + language annotations in one shot (single rollout per attempt).
+// If no language matches, sidecar annotation is removed to revert to original state.
 // Workloads already processed (tracked in status) at current generation are skipped.
 func (r *ParseableConfigReconciler) ensureAnnotations(ctx context.Context, config *observabilityv1alpha1.ParseableConfig) error {
 	logger := log.FromContext(ctx)

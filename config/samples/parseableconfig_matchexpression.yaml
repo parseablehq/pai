@@ -11,16 +11,13 @@ spec:
     namespaces:
       - demo
 
-  # Include only paymentservice, currencyservice and recommendationservice
+  # matchLabels: simple key=value equality
+  # A workload must have ALL listed labels to match.
+  # This example includes only paymentservice, currencyservice, and recommendationservice.
   workloadSelector:
     mode: include
-    matchExpressions:
-      - key: app
-        operator: In
-        values:
-          - paymentservice
-          - currencyservice
-          - recommendationservice
+    matchLabels:
+      app: paymentservice
 
   target:
     endpoint: http://106.51.126.91:8010
@@ -28,9 +25,7 @@ spec:
       name: parseable-creds
       namespace: parseable-operator-system
     streams:
-      logs: prod-logs
-      traces: prod-traces
-      metrics: prod-metrics
+      traces: prod-traces-demo-new
 
   instrumentation:
     languages:
@@ -38,4 +33,4 @@ spec:
       - python
       - nodejs
       - dotnet
-    detectionTimeout: "2m"
+    detectionTimeout: "1m"

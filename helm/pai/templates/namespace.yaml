@@ -1,0 +1,6 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Release.Namespace }}
+  labels:
+    {{- include "pai.labels" . | nindent 4 }}

@@ -1,0 +1,14 @@
+apiVersion: v2
+name: pai
+description: Parseable Auto Instrumentation (PAI) operator for Kubernetes
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - observability
+  - opentelemetry
+  - auto-instrumentation
+  - parseable
+home: https://github.com/parseablehq/pai
+maintainers:
+  - name: Parseable

@@ -11,7 +11,9 @@ spec:
     namespaces:
       - demo
 
-  # Include only adservice (Java)
+  # matchLabels: simple key=value equality
+  # A workload must have ALL listed labels to match.
+  # This example includes only the adservice deployment.
   workloadSelector:
     mode: include
     matchLabels:
@@ -23,9 +25,7 @@ spec:
       name: parseable-creds
       namespace: parseable-operator-system
     streams:
-      logs: prod-logs
-      traces: prod-traces
-      metrics: prod-metrics
+      traces: prod-traces-demo-new
 
   instrumentation:
     languages:
@@ -33,4 +33,4 @@ spec:
       - python
       - nodejs
       - dotnet
-    detectionTimeout: "2m"
+    detectionTimeout: "1m"
