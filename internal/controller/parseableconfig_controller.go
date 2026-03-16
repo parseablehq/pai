@@ -57,9 +57,9 @@ const (
 	instrumentationAnnotPrefix = "instrumentation.opentelemetry.io/inject-"
 	instrumentationRefValue    = otelOperatorNamespace + "/" + instrumentationName
 
-	sidecarMetricsPort         = "8888"
-	metricsCheckMetric         = "otelcol_receiver_accepted_spans_total"
-	defaultDetectionTimeout    = 1 * time.Minute
+	sidecarMetricsPort      = "8888"
+	metricsCheckMetric      = "otelcol_receiver_accepted_spans_total"
+	defaultDetectionTimeout = 1 * time.Minute
 
 	finalizerName = "observability.parseable.com/finalizer"
 )
@@ -1057,7 +1057,6 @@ func (r *ParseableConfigReconciler) getExistingPodNames(ctx context.Context, w w
 	}
 	return names
 }
-
 
 // fetchSidecarMetrics fetches metrics from the sidecar's /metrics endpoint
 // Uses the Kubernetes pod proxy API which works both locally and in-cluster
