@@ -161,6 +161,9 @@ type WorkloadInstrumentationStatus struct {
 	// LastDetectionTime is when detection was last performed
 	LastDetectionTime *metav1.Time `json:"lastDetectionTime,omitempty"`
 
+	// ContainerImage is the image that was running when detection was performed
+	ContainerImage string `json:"containerImage,omitempty"`
+
 	// ObservedGeneration is the CR generation when this workload was last processed
 	ObservedGeneration int64 `json:"observedGeneration"`
 }

@@ -77,6 +77,27 @@ var languageBinaryChecks = map[string][][]string{
 	"dotnet": {{"dotnet", "--version"}},
 }
 
+// imageHeuristics maps container image name patterns to languages.
+// Checked in order; first match wins. Patterns are matched against the image
+// name (without tag) in lowercase.
+var imageHeuristics = []struct {
+	patterns []string
+	language string
+}{
+	{patterns: []string{"openjdk", "eclipse-temurin", "amazoncorretto", "azul/zulu", "liberica", "graalvm"}, language: "java"},
+	{patterns: []string{"python", "django", "flask", "fastapi"}, language: "python"},
+	{patterns: []string{"node", "nodejs"}, language: "nodejs"},
+	{patterns: []string{"dotnet", "aspnet", "mcr.microsoft.com/dotnet"}, language: "dotnet"},
+}
+
+// infraImages are base images that are known infrastructure (not instrumentable).
+// If a container image matches one of these, skip detection entirely.
+var infraImages = []string{
+	"redis", "postgres", "mysql", "mongo", "memcached", "nginx",
+	"envoyproxy", "istio", "vault", "consul", "elasticsearch", "rabbitmq",
+	"kafka", "zookeeper", "etcd", "busybox", "alpine",
+}
+
 // auto-instrumentation images per language
 // Note: Go auto-instrumentation requires enabling a feature flag on the OTel operator
 var languageImages = map[string]string{
@@ -930,13 +951,14 @@ func workloadKey(obj client.Object) string {
 
 // isWorkloadProcessed checks if a workload should be skipped.
 // Skip if:
-//   - Already successfully instrumented (any generation) — don't redo what works
+//   - Already successfully instrumented AND container image hasn't changed
 //   - Already tried and failed at the current generation — don't retry same config
 //
 // Re-process if:
+//   - Container image changed since last detection (regardless of success)
 //   - Failed (instrumented=false) at an older generation — new config might help
 //   - Not in status at all — never processed
-func isWorkloadProcessed(config *observabilityv1alpha1.ParseableConfig, obj client.Object) *observabilityv1alpha1.WorkloadInstrumentationStatus {
+func isWorkloadProcessed(config *observabilityv1alpha1.ParseableConfig, obj client.Object, currentImage string) *observabilityv1alpha1.WorkloadInstrumentationStatus {
 	kind := "Deployment"
 	if _, ok := obj.(*appsv1.StatefulSet); ok {
 		kind = "StatefulSet"
@@ -944,7 +966,11 @@ func isWorkloadProcessed(config *observabilityv1alpha1.ParseableConfig, obj clie
 	for i := range config.Status.Workloads {
 		ws := &config.Status.Workloads[i]
 		if ws.Name == obj.GetName() && ws.Namespace == obj.GetNamespace() && ws.Kind == kind {
-			// Successfully instrumented — always skip
+			// Image changed — re-detect regardless of previous result
+			if currentImage != "" && ws.ContainerImage != "" && ws.ContainerImage != currentImage {
+				return nil
+			}
+			// Successfully instrumented — skip
 			if ws.Instrumented {
 				return ws
 			}
@@ -960,7 +986,7 @@ func isWorkloadProcessed(config *observabilityv1alpha1.ParseableConfig, obj clie
 }
 
 // updateWorkloadStatus updates or adds a workload's status entry and persists it
-func (r *ParseableConfigReconciler) updateWorkloadStatus(ctx context.Context, config *observabilityv1alpha1.ParseableConfig, obj client.Object, lang string, instrumented bool) {
+func (r *ParseableConfigReconciler) updateWorkloadStatus(ctx context.Context, config *observabilityv1alpha1.ParseableConfig, obj client.Object, lang string, instrumented bool, containerImage string) {
 	logger := log.FromContext(ctx)
 
 	kind := "Deployment"
@@ -975,6 +1001,7 @@ func (r *ParseableConfigReconciler) updateWorkloadStatus(ctx context.Context, co
 		Kind:               kind,
 		DetectedLanguage:   lang,
 		Instrumented:       instrumented,
+		ContainerImage:     containerImage,
 		LastDetectionTime:  &now,
 		ObservedGeneration: config.Generation,
 	}
@@ -1086,10 +1113,15 @@ func (r *ParseableConfigReconciler) ensureAnnotations(ctx context.Context, confi
 		}
 	}
 
-	// Filter out already-processed workloads (using status)
+	// Filter out already-processed workloads (using status + image change detection)
 	var needsDetection []client.Object
 	for _, obj := range allWorkloads {
-		if ws := isWorkloadProcessed(config, obj); ws != nil {
+		w := r.wrapWorkload(obj)
+		currentImage := ""
+		if w != nil {
+			currentImage = w.getContainerImage()
+		}
+		if ws := isWorkloadProcessed(config, obj, currentImage); ws != nil {
 			logger.Info("Workload already processed, skipping",
 				"name", obj.GetName(), "namespace", obj.GetNamespace(),
 				"language", ws.DetectedLanguage, "instrumented", ws.Instrumented)
@@ -1351,6 +1383,7 @@ type workload interface {
 	getPodTemplateAnnotations() map[string]string
 	setPodTemplateAnnotations(map[string]string)
 	getPodSelector() labels.Selector
+	getContainerImage() string
 }
 
 type deploymentWorkload struct {
@@ -1370,6 +1403,13 @@ func (d *deploymentWorkload) getPodSelector() labels.Selector {
 	return sel
 }
 
+func (d *deploymentWorkload) getContainerImage() string {
+	if len(d.Spec.Template.Spec.Containers) > 0 {
+		return d.Spec.Template.Spec.Containers[0].Image
+	}
+	return ""
+}
+
 type statefulSetWorkload struct {
 	*appsv1.StatefulSet
 }
@@ -1387,30 +1427,62 @@ func (s *statefulSetWorkload) getPodSelector() labels.Selector {
 	return sel
 }
 
-// detectLanguage detects the workload's language by exec-ing into a running pod,
-// then adds the correct instrumentation annotation (single rollout).
+func (s *statefulSetWorkload) getContainerImage() string {
+	if len(s.Spec.Template.Spec.Containers) > 0 {
+		return s.Spec.Template.Spec.Containers[0].Image
+	}
+	return ""
+}
+
+// detectLanguage detects the workload's language using a multi-phase approach:
+//  1. Image heuristics — parse container image name for known language patterns
+//  2. Skip infra images — known infrastructure images (redis, postgres, etc.)
+//  3. Exec-based detection — try multiple running pods, read /proc/1/cmdline and check binaries
+//
+// Then adds the correct instrumentation annotation (single rollout).
 func (r *ParseableConfigReconciler) detectLanguage(ctx context.Context, config *observabilityv1alpha1.ParseableConfig, obj client.Object) error {
 	logger := log.FromContext(ctx)
 
 	w := r.wrapWorkload(obj)
+	containerImage := w.getContainerImage()
+	languages := config.Spec.Traces.Instrumentation.Languages
 
-	// Find a running pod for this workload
-	pod, err := r.findRunningPod(ctx, w)
-	if err != nil || pod == nil {
-		logger.Info("No running pod found, skipping detection", "name", obj.GetName(), "namespace", obj.GetNamespace())
+	// Phase 1: Check if this is a known infrastructure image — skip entirely
+	if isInfraImage(containerImage) {
+		logger.Info("Infrastructure image, skipping", "name", obj.GetName(), "image", containerImage)
+		r.updateWorkloadStatus(ctx, config, obj, "", false, containerImage)
 		return nil
 	}
 
-	containerName := pod.Spec.Containers[0].Name
-	lang := r.detectLanguageByExec(ctx, pod.Name, pod.Namespace, containerName, config.Spec.Traces.Instrumentation.Languages)
+	// Phase 2: Image name heuristics — fast, works for distroless too
+	lang := detectLanguageByImage(containerImage, languages)
+	if lang != "" {
+		logger.Info("Language detected via image heuristic", "name", obj.GetName(), "image", containerImage, "language", lang)
+	}
+
+	// Phase 3: Exec-based detection — try multiple pods
+	if lang == "" {
+		pods, err := r.findRunningPods(ctx, w, 3)
+		if err != nil || len(pods) == 0 {
+			logger.Info("No running pods found, skipping detection", "name", obj.GetName(), "namespace", obj.GetNamespace())
+			return nil
+		}
+
+		for _, pod := range pods {
+			containerName := pod.Spec.Containers[0].Name
+			lang = r.detectLanguageByExec(ctx, pod.Name, pod.Namespace, containerName, languages)
+			if lang != "" {
+				logger.Info("Language detected via exec", "name", obj.GetName(), "pod", pod.Name, "language", lang)
+				break
+			}
+		}
+	}
 
 	if lang == "" {
-		logger.Info("No language detected", "name", obj.GetName(), "namespace", obj.GetNamespace())
-		r.updateWorkloadStatus(ctx, config, obj, "", false)
+		logger.Info("No language detected", "name", obj.GetName(), "namespace", obj.GetNamespace(), "image", containerImage)
+		r.updateWorkloadStatus(ctx, config, obj, "", false, containerImage)
 		return nil
 	}
-
-	logger.Info("Language detected via exec", "name", obj.GetName(), "namespace", obj.GetNamespace(), "language", lang)
 
 	// Add instrumentation annotation (single rollout)
 	key := instrumentationAnnotPrefix + lang
@@ -1437,23 +1509,85 @@ func (r *ParseableConfigReconciler) detectLanguage(ctx context.Context, config *
 		break
 	}
 
-	r.updateWorkloadStatus(ctx, config, obj, lang, true)
+	r.updateWorkloadStatus(ctx, config, obj, lang, true, containerImage)
 	return nil
 }
 
-// findRunningPod returns a running, ready pod for the given workload
-func (r *ParseableConfigReconciler) findRunningPod(ctx context.Context, w workload) (*corev1.Pod, error) {
+// detectLanguageByImage checks the container image name against known language patterns.
+// Returns the detected language or empty string if no match.
+func detectLanguageByImage(image string, allowedLanguages []string) string {
+	if image == "" {
+		return ""
+	}
+
+	// Strip tag/digest — only check the image name
+	imageLower := strings.ToLower(image)
+	if idx := strings.LastIndex(imageLower, ":"); idx != -1 {
+		imageLower = imageLower[:idx]
+	}
+	if idx := strings.LastIndex(imageLower, "@"); idx != -1 {
+		imageLower = imageLower[:idx]
+	}
+
+	allowed := make(map[string]bool, len(allowedLanguages))
+	for _, l := range allowedLanguages {
+		allowed[l] = true
+	}
+
+	for _, h := range imageHeuristics {
+		if !allowed[h.language] {
+			continue
+		}
+		for _, pattern := range h.patterns {
+			if strings.Contains(imageLower, pattern) {
+				return h.language
+			}
+		}
+	}
+
+	return ""
+}
+
+// isInfraImage checks if the container image is a known infrastructure image
+// that doesn't support auto-instrumentation.
+func isInfraImage(image string) bool {
+	if image == "" {
+		return false
+	}
+	imageLower := strings.ToLower(image)
+	// Strip tag
+	if idx := strings.LastIndex(imageLower, ":"); idx != -1 {
+		imageLower = imageLower[:idx]
+	}
+	// Get just the image name (last path component)
+	if idx := strings.LastIndex(imageLower, "/"); idx != -1 {
+		imageLower = imageLower[idx+1:]
+	}
+	for _, infra := range infraImages {
+		if strings.Contains(imageLower, infra) {
+			return true
+		}
+	}
+	return false
+}
+
+// findRunningPods returns up to maxPods running, ready pods for the given workload.
+func (r *ParseableConfigReconciler) findRunningPods(ctx context.Context, w workload, maxPods int) ([]*corev1.Pod, error) {
 	podList := &corev1.PodList{}
 	if err := r.List(ctx, podList, client.InNamespace(w.GetNamespace()), client.MatchingLabelsSelector{Selector: w.getPodSelector()}); err != nil {
 		return nil, err
 	}
+	var result []*corev1.Pod
 	for i := range podList.Items {
 		pod := &podList.Items[i]
 		if pod.DeletionTimestamp == nil && pod.Status.Phase == corev1.PodRunning && isPodReady(pod) {
-			return pod, nil
+			result = append(result, pod)
+			if len(result) >= maxPods {
+				break
+			}
 		}
 	}
-	return nil, nil
+	return result, nil
 }
 
 // detectLanguageByExec detects the language runtime by exec-ing into the container.

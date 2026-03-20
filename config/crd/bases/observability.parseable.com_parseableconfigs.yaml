@@ -320,6 +320,10 @@ spec:
                   description: WorkloadInstrumentationStatus tracks the detection
                     result for a single workload
                   properties:
+                    containerImage:
+                      description: ContainerImage is the image that was running when
+                        detection was performed
+                      type: string
                     detectedLanguage:
                       description: DetectedLanguage is the language that was detected
                         (empty if none matched)
