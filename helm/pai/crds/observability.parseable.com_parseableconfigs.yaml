@@ -39,108 +39,98 @@ spec:
           spec:
             description: ParseableConfigSpec defines the desired state of ParseableConfig
             properties:
-              instrumentation:
-                description: Instrumentation defines auto-instrumentation settings
-                properties:
-                  detectionTimeout:
-                    description: |-
-                      DetectionTimeout is how long (e.g. "60s", "2m") to wait for spans per language attempt during auto-detection.
-                      Defaults to "1m" if not set.
-                    type: string
-                  languages:
-                    description: Languages specifies which programming languages to
-                      instrument
-                    items:
-                      type: string
-                    type: array
-                type: object
-              kubernetesEvents:
-                description: KubernetesEvents defines Kubernetes event collection
-                  settings
+              events:
+                description: Events defines Kubernetes events collection configuration
                 properties:
                   enabled:
-                    description: Enabled specifies whether Kubernetes event collection
-                      is enabled
+                    description: Enabled controls whether Kubernetes events are collected
                     type: boolean
-                  eventTypes:
-                    description: EventTypes specifies which event types to collect
-                    items:
-                      type: string
-                    type: array
+                  namespaceSelector:
+                    description: NamespaceSelector defines which namespaces to collect
+                      events from
+                    properties:
+                      mode:
+                        description: Mode specifies whether to include or exclude
+                          the listed namespaces
+                        enum:
+                        - include
+                        - exclude
+                        type: string
+                      namespaces:
+                        description: Namespaces is the list of namespace names
+                        items:
+                          type: string
+                        type: array
+                    type: object
+                  stream:
+                    description: Stream is the Parseable stream name for event data
+                    type: string
+                required:
+                - enabled
                 type: object
               logs:
                 description: Logs defines logging configuration
                 properties:
-                  collector:
-                    description: Collector specifies the log collector to use
-                    type: string
-                  enabled:
-                    description: Enabled specifies whether log collection is enabled
-                    type: boolean
-                  enrichment:
-                    description: Enrichment defines log enrichment options
+                  namespaceSelector:
+                    description: NamespaceSelector defines which namespaces to collect
+                      logs from
                     properties:
-                      kubernetesMetadata:
-                        description: KubernetesMetadata enables enriching logs with
-                          Kubernetes metadata
+                      mode:
+                        description: Mode specifies whether to include or exclude
+                          the listed namespaces
+                        enum:
+                        - include
+                        - exclude
+                        type: string
+                      namespaces:
+                        description: Namespaces is the list of namespace names
+                        items:
+                          type: string
+                        type: array
+                    type: object
+                  stream:
+                    description: Stream is the Parseable stream name for log data
+                    type: string
+                required:
+                - stream
+                type: object
+              metrics:
+                description: Metrics defines metrics configuration
+                properties:
+                  namespaceSelector:
+                    description: NamespaceSelector defines which namespaces to collect
+                      metrics from
+                    properties:
+                      mode:
+                        description: Mode specifies whether to include or exclude
+                          the listed namespaces
+                        enum:
+                        - include
+                        - exclude
+                        type: string
+                      namespaces:
+                        description: Namespaces is the list of namespace names
+                        items:
+                          type: string
+                        type: array
+                    type: object
+                  nodeMetrics:
+                    description: NodeMetrics controls collection of node-level metrics
+                      via kubeletstats receiver
+                    properties:
+                      enabled:
+                        description: Enabled controls whether node metrics (CPU, memory,
+                          disk, network) are collected via kubeletstats
                         type: boolean
                     type: object
-                type: object
-              namespaceSelector:
-                description: NamespaceSelector defines which namespaces to include
-                  or exclude from instrumentation
-                properties:
-                  mode:
-                    description: Mode specifies whether to include or exclude the
-                      listed namespaces
-                    enum:
-                    - include
-                    - exclude
+                  stream:
+                    description: Stream is the Parseable stream name for metric data
                     type: string
-                  namespaces:
-                    description: Namespaces is the list of namespace names
-                    items:
-                      type: string
-                    type: array
-                type: object
-              nodeMetrics:
-                description: NodeMetrics defines node-level metrics collection settings
-                properties:
-                  collectors:
-                    description: Collectors specifies which metric collectors to enable
-                    items:
-                      type: string
-                    type: array
-                  enabled:
-                    description: Enabled specifies whether node metrics collection
-                      is enabled
-                    type: boolean
-                  scrapeInterval:
-                    description: ScrapeInterval is the interval at which to scrape
-                      metrics
-                    type: string
-                type: object
-              resources:
-                description: Resources defines resource configurations for operator-managed
-                  workloads
-                properties:
-                  daemonSet:
-                    description: DaemonSet defines resources for DaemonSet workloads
-                    properties:
-                      limits:
-                        additionalProperties:
-                          anyOf:
-                          - type: integer
-                          - type: string
-                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
-                          x-kubernetes-int-or-string: true
-                        description: Limits describes the maximum amount of compute
-                          resources allowed
-                        type: object
-                    type: object
+                required:
+                - stream
                 type: object
               target:
-                description: Target defines the Parseable endpoint configuration
+                description: Target defines the global Parseable endpoint and credentials
                 properties:
                   credentialsSecret:
                     description: CredentialsSecret references the secret containing
@@ -159,81 +149,106 @@ spec:
                   endpoint:
                     description: Endpoint is the Parseable API endpoint URL for ingestion
                     type: string
-                  streams:
-                    description: Streams defines the stream names for different telemetry
-                      types
-                    properties:
-                      logs:
-                        description: Logs is the stream name for log data
-                        type: string
-                      metrics:
-                        description: Metrics is the stream name for metric data
-                        type: string
-                      traces:
-                        description: Traces is the stream name for trace data
-                        type: string
-                    type: object
                 required:
                 - credentialsSecret
                 - endpoint
                 type: object
-              workloadSelector:
-                description: |-
-                  WorkloadSelector defines which workloads to include or exclude by labels.
-                  In "include" mode, only workloads with ALL matching labels are instrumented.
-                  In "exclude" mode, workloads with ALL matching labels are skipped.
-                  If not set, all workloads in selected namespaces are instrumented.
+              traces:
+                description: Traces defines tracing configuration
                 properties:
-                  matchExpressions:
-                    description: matchExpressions is a list of label selector requirements.
-                      The requirements are ANDed.
-                    items:
-                      description: |-
-                        A label selector requirement is a selector that contains values, a key, and an operator that
-                        relates the key and values.
-                      properties:
-                        key:
-                          description: key is the label key that the selector applies
-                            to.
+                  instrumentation:
+                    description: Instrumentation defines auto-instrumentation settings
+                      for traces
+                    properties:
+                      detectionTimeout:
+                        description: |-
+                          DetectionTimeout is how long (e.g. "60s", "2m") to wait during auto-detection.
+                          Defaults to "1m" if not set.
+                        type: string
+                      languages:
+                        description: Languages specifies which programming languages
+                          to instrument
+                        items:
                           type: string
-                        operator:
-                          description: |-
-                            operator represents a key's relationship to a set of values.
-                            Valid operators are In, NotIn, Exists and DoesNotExist.
-                          type: string
-                        values:
-                          description: |-
-                            values is an array of string values. If the operator is In or NotIn,
-                            the values array must be non-empty. If the operator is Exists or DoesNotExist,
-                            the values array must be empty. This array is replaced during a strategic
-                            merge patch.
-                          items:
-                            type: string
-                          type: array
-                          x-kubernetes-list-type: atomic
-                      required:
-                      - key
-                      - operator
-                      type: object
-                    type: array
-                    x-kubernetes-list-type: atomic
-                  matchLabels:
-                    additionalProperties:
-                      type: string
-                    description: |-
-                      matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
-                      map is equivalent to an element of matchExpressions, whose key field is "key", the
-                      operator is "In", and the values array contains only "value". The requirements are ANDed.
+                        type: array
                     type: object
-                  mode:
-                    description: Mode specifies whether to include or exclude workloads
-                      matching the selector
-                    enum:
-                    - include
-                    - exclude
+                  namespaceSelector:
+                    description: NamespaceSelector defines which namespaces to target
+                      for tracing
+                    properties:
+                      mode:
+                        description: Mode specifies whether to include or exclude
+                          the listed namespaces
+                        enum:
+                        - include
+                        - exclude
+                        type: string
+                      namespaces:
+                        description: Namespaces is the list of namespace names
+                        items:
+                          type: string
+                        type: array
+                    type: object
+                  stream:
+                    description: Stream is the Parseable stream name for trace data
                     type: string
+                  workloadSelector:
+                    description: WorkloadSelector defines which workloads to include
+                      or exclude by labels
+                    properties:
+                      matchExpressions:
+                        description: matchExpressions is a list of label selector
+                          requirements. The requirements are ANDed.
+                        items:
+                          description: |-
+                            A label selector requirement is a selector that contains values, a key, and an operator that
+                            relates the key and values.
+                          properties:
+                            key:
+                              description: key is the label key that the selector
+                                applies to.
+                              type: string
+                            operator:
+                              description: |-
+                                operator represents a key's relationship to a set of values.
+                                Valid operators are In, NotIn, Exists and DoesNotExist.
+                              type: string
+                            values:
+                              description: |-
+                                values is an array of string values. If the operator is In or NotIn,
+                                the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                the values array must be empty. This array is replaced during a strategic
+                                merge patch.
+                              items:
+                                type: string
+                              type: array
+                              x-kubernetes-list-type: atomic
+                          required:
+                          - key
+                          - operator
+                          type: object
+                        type: array
+                        x-kubernetes-list-type: atomic
+                      matchLabels:
+                        additionalProperties:
+                          type: string
+                        description: |-
+                          matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                          map is equivalent to an element of matchExpressions, whose key field is "key", the
+                          operator is "In", and the values array contains only "value". The requirements are ANDed.
+                        type: object
+                      mode:
+                        description: Mode specifies whether to include or exclude
+                          workloads matching the selector
+                        enum:
+                        - include
+                        - exclude
+                        type: string
+                    type: object
+                    x-kubernetes-map-type: atomic
+                required:
+                - stream
                 type: object
-                x-kubernetes-map-type: atomic
             required:
             - target
             type: object
@@ -305,6 +320,10 @@ spec:
                   description: WorkloadInstrumentationStatus tracks the detection
                     result for a single workload
                   properties:
+                    containerImage:
+                      description: ContainerImage is the image that was running when
+                        detection was performed
+                      type: string
                     detectedLanguage:
                       description: DetectedLanguage is the language that was detected
                         (empty if none matched)
