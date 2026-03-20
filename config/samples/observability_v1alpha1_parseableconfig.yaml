@@ -13,7 +13,7 @@ spec:
       namespace: parseable-operator-system
 
   traces:
-    stream: pai-traces
+    stream: pai-traces-ds
     namespaceSelector:
       mode: include
       namespaces:

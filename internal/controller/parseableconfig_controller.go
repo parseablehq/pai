@@ -59,9 +59,10 @@ const (
 	sidecarCollectorName = "pai-sidecar"
 	sidecarAnnotation    = "sidecar.opentelemetry.io/inject"
 
-	logCollectorName         = "pai-log-collector"
+	logCollectorName           = "pai-log-collector"
 	metricsEventsCollectorName = "pai-metrics-events-collector"
 	collectorClusterRoleName   = "pai-collector"
+	paiAgentDaemonSetName      = "pai-agent"
 
 	instrumentationAnnotPrefix = "instrumentation.opentelemetry.io/inject-"
 	instrumentationRefValue    = otelOperatorNamespace + "/" + instrumentationName
@@ -88,14 +89,6 @@ var imageHeuristics = []struct {
 	{patterns: []string{"python", "django", "flask", "fastapi"}, language: "python"},
 	{patterns: []string{"node", "nodejs"}, language: "nodejs"},
 	{patterns: []string{"dotnet", "aspnet", "mcr.microsoft.com/dotnet"}, language: "dotnet"},
-}
-
-// infraImages are base images that are known infrastructure (not instrumentable).
-// If a container image matches one of these, skip detection entirely.
-var infraImages = []string{
-	"redis", "postgres", "mysql", "mongo", "memcached", "nginx",
-	"envoyproxy", "istio", "vault", "consul", "elasticsearch", "rabbitmq",
-	"kafka", "zookeeper", "etcd", "busybox", "alpine",
 }
 
 // auto-instrumentation images per language
@@ -125,6 +118,7 @@ type ParseableConfigReconciler struct {
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=opentelemetry.io,resources=opentelemetrycollectors,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=opentelemetry.io,resources=instrumentations,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=apps,resources=daemonsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles;clusterrolebindings,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch
 
@@ -180,31 +174,37 @@ func (r *ParseableConfigReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, err
 	}
 
-	// Step 3: Detect languages via exec and annotate workloads (single rollout per workload)
+	// Step 3: Ensure PAI agent DaemonSet for host-level process detection (distroless support)
+	if err := r.ensurePaiAgent(ctx, config); err != nil {
+		logger.Error(err, "Failed to ensure PAI agent DaemonSet")
+		return ctrl.Result{}, err
+	}
+
+	// Step 4: Detect languages via exec and annotate workloads (single rollout per workload)
 	if err := r.ensureAnnotations(ctx, config); err != nil {
 		logger.Error(err, "Failed to ensure annotations")
 		return ctrl.Result{}, err
 	}
 
-	// Step 4: Ensure collector RBAC (ClusterRole + bindings for collector ServiceAccounts)
+	// Step 5: Ensure collector RBAC (ClusterRole + bindings for collector ServiceAccounts)
 	if err := r.ensureCollectorRBAC(ctx); err != nil {
 		logger.Error(err, "Failed to ensure collector RBAC")
 		return ctrl.Result{}, err
 	}
 
-	// Step 5: Ensure log collector DaemonSet if logs are enabled
+	// Step 6: Ensure log collector DaemonSet if logs are enabled
 	if err := r.ensureLogCollector(ctx, config); err != nil {
 		logger.Error(err, "Failed to ensure log collector")
 		return ctrl.Result{}, err
 	}
 
-	// Step 6: Ensure metrics+events collector Deployment
+	// Step 7: Ensure metrics+events collector Deployment
 	if err := r.ensureMetricsEventsCollector(ctx, config); err != nil {
 		logger.Error(err, "Failed to ensure metrics/events collector")
 		return ctrl.Result{}, err
 	}
 
-	return ctrl.Result{}, nil
+	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 }
 
 // ensureOtelOperator checks if the otel operator is installed, installs it if not
@@ -1213,7 +1213,18 @@ func (r *ParseableConfigReconciler) cleanup(ctx context.Context, config *observa
 	// Step 4: Delete Metrics/Events Collector CR
 	r.deleteCollectorCR(ctx, metricsEventsCollectorName)
 
-	// Step 5: Delete Sidecar Collector CR (legacy)
+	// Step 5: Delete PAI agent DaemonSet
+	logger.Info("Deleting PAI agent DaemonSet")
+	agentDS := &appsv1.DaemonSet{}
+	if err := r.Get(ctx, client.ObjectKey{Name: paiAgentDaemonSetName, Namespace: otelOperatorNamespace}, agentDS); err == nil {
+		if err := r.Delete(ctx, agentDS); err != nil && !errors.IsNotFound(err) {
+			logger.Error(err, "Failed to delete PAI agent DaemonSet")
+		} else {
+			logger.Info("PAI agent DaemonSet deleted")
+		}
+	}
+
+	// Step 6: Delete Sidecar Collector CR (legacy)
 	logger.Info("Deleting Sidecar Collector CR", "name", sidecarCollectorName, "namespace", otelOperatorNamespace)
 	collector := &unstructured.Unstructured{}
 	collector.SetGroupVersionKind(schema.GroupVersionKind{
@@ -1436,8 +1447,9 @@ func (s *statefulSetWorkload) getContainerImage() string {
 
 // detectLanguage detects the workload's language using a multi-phase approach:
 //  1. Image heuristics — parse container image name for known language patterns
-//  2. Skip infra images — known infrastructure images (redis, postgres, etc.)
-//  3. Exec-based detection — try multiple running pods, read /proc/1/cmdline and check binaries
+//  2. Exec-based detection — try multiple running pods, read /proc/1/cmdline and check binaries
+//  3. Agent-based detection — for distroless containers, use the PAI agent DaemonSet
+//     to read /proc/<pid>/cmdline from the host via cgroup PID lookup
 //
 // Then adds the correct instrumentation annotation (single rollout).
 func (r *ParseableConfigReconciler) detectLanguage(ctx context.Context, config *observabilityv1alpha1.ParseableConfig, obj client.Object) error {
@@ -1447,20 +1459,13 @@ func (r *ParseableConfigReconciler) detectLanguage(ctx context.Context, config *
 	containerImage := w.getContainerImage()
 	languages := config.Spec.Traces.Instrumentation.Languages
 
-	// Phase 1: Check if this is a known infrastructure image — skip entirely
-	if isInfraImage(containerImage) {
-		logger.Info("Infrastructure image, skipping", "name", obj.GetName(), "image", containerImage)
-		r.updateWorkloadStatus(ctx, config, obj, "", false, containerImage)
-		return nil
-	}
-
-	// Phase 2: Image name heuristics — fast, works for distroless too
+	// Phase 1: Image name heuristics — fast, works for distroless too
 	lang := detectLanguageByImage(containerImage, languages)
 	if lang != "" {
 		logger.Info("Language detected via image heuristic", "name", obj.GetName(), "image", containerImage, "language", lang)
 	}
 
-	// Phase 3: Exec-based detection — try multiple pods
+	// Phase 2: Exec-based detection — try multiple pods
 	if lang == "" {
 		pods, err := r.findRunningPods(ctx, w, 3)
 		if err != nil || len(pods) == 0 {
@@ -1474,6 +1479,17 @@ func (r *ParseableConfigReconciler) detectLanguage(ctx context.Context, config *
 			if lang != "" {
 				logger.Info("Language detected via exec", "name", obj.GetName(), "pod", pod.Name, "language", lang)
 				break
+			}
+		}
+
+		// Phase 3: Agent-based detection — for distroless containers where exec fails
+		if lang == "" {
+			for _, pod := range pods {
+				lang = r.detectLanguageViaAgent(ctx, pod, languages)
+				if lang != "" {
+					logger.Info("Language detected via agent (host /proc)", "name", obj.GetName(), "pod", pod.Name, "language", lang)
+					break
+				}
 			}
 		}
 	}
@@ -1548,27 +1564,193 @@ func detectLanguageByImage(image string, allowedLanguages []string) string {
 	return ""
 }
 
-// isInfraImage checks if the container image is a known infrastructure image
-// that doesn't support auto-instrumentation.
-func isInfraImage(image string) bool {
-	if image == "" {
-		return false
+// ensurePaiAgent creates or updates the PAI agent DaemonSet that runs on every node.
+// The agent mounts the host's /proc and /sys/fs/cgroup read-only so the operator
+// can read process cmdlines for distroless containers that don't have a shell.
+func (r *ParseableConfigReconciler) ensurePaiAgent(ctx context.Context, config *observabilityv1alpha1.ParseableConfig) error {
+	logger := log.FromContext(ctx)
+
+	// Only needed when traces with instrumentation are configured
+	if config.Spec.Traces == nil || len(config.Spec.Traces.Instrumentation.Languages) == 0 {
+		// Clean up if it exists
+		existing := &appsv1.DaemonSet{}
+		if err := r.Get(ctx, client.ObjectKey{Name: paiAgentDaemonSetName, Namespace: otelOperatorNamespace}, existing); err == nil {
+			logger.Info("No instrumentation configured, deleting PAI agent DaemonSet")
+			if err := r.Delete(ctx, existing); err != nil && !errors.IsNotFound(err) {
+				return fmt.Errorf("failed to delete PAI agent DaemonSet: %w", err)
+			}
+		}
+		return nil
 	}
-	imageLower := strings.ToLower(image)
-	// Strip tag
-	if idx := strings.LastIndex(imageLower, ":"); idx != -1 {
-		imageLower = imageLower[:idx]
+
+	hostPathDirectory := corev1.HostPathDirectory
+	privileged := true
+	desired := &appsv1.DaemonSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      paiAgentDaemonSetName,
+			Namespace: otelOperatorNamespace,
+			Labels: map[string]string{
+				"app.kubernetes.io/name":       "pai-agent",
+				"app.kubernetes.io/managed-by": "pai",
+			},
+		},
+		Spec: appsv1.DaemonSetSpec{
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"app.kubernetes.io/name": "pai-agent",
+				},
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						"app.kubernetes.io/name": "pai-agent",
+					},
+				},
+				Spec: corev1.PodSpec{
+					HostPID: true,
+					Containers: []corev1.Container{
+						{
+							Name:    "agent",
+							Image:   "busybox:stable",
+							Command: []string{"sleep", "infinity"},
+							SecurityContext: &corev1.SecurityContext{
+								Privileged: &privileged,
+							},
+							VolumeMounts: []corev1.VolumeMount{
+								{
+									Name:      "host-proc",
+									MountPath: "/host/proc",
+									ReadOnly:  true,
+								},
+							},
+						},
+					},
+					Volumes: []corev1.Volume{
+						{
+							Name: "host-proc",
+							VolumeSource: corev1.VolumeSource{
+								HostPath: &corev1.HostPathVolumeSource{
+									Path: "/proc",
+									Type: &hostPathDirectory,
+								},
+							},
+						},
+					},
+				},
+			},
+		},
 	}
-	// Get just the image name (last path component)
-	if idx := strings.LastIndex(imageLower, "/"); idx != -1 {
-		imageLower = imageLower[idx+1:]
+
+	existing := &appsv1.DaemonSet{}
+	err := r.Get(ctx, client.ObjectKeyFromObject(desired), existing)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			if err := r.Create(ctx, desired); err != nil {
+				return fmt.Errorf("failed to create PAI agent DaemonSet: %w", err)
+			}
+			logger.Info("PAI agent DaemonSet created")
+			return nil
+		}
+		return err
 	}
-	for _, infra := range infraImages {
-		if strings.Contains(imageLower, infra) {
-			return true
+
+	// Already exists, nothing to update
+	return nil
+}
+
+// detectLanguageViaAgent uses the PAI agent DaemonSet to read process cmdlines from the host.
+// This works for distroless containers where exec-based detection fails because there is no shell.
+// Flow: find agent pod on same node → use hostPID to read /host/proc/*/cmdline → match container PID.
+func (r *ParseableConfigReconciler) detectLanguageViaAgent(ctx context.Context, targetPod *corev1.Pod, languages []string) string {
+	logger := log.FromContext(ctx)
+
+	if targetPod.Status.HostIP == "" {
+		return ""
+	}
+
+	// Find the target container's ID to look up its PID
+	if len(targetPod.Status.ContainerStatuses) == 0 {
+		return ""
+	}
+	containerID := targetPod.Status.ContainerStatuses[0].ContainerID
+	if containerID == "" {
+		return ""
+	}
+	// containerID format: containerd://abc123... — extract just the hash
+	if idx := strings.LastIndex(containerID, "//"); idx != -1 {
+		containerID = containerID[idx+2:]
+	}
+
+	// Find the PAI agent pod running on the same node
+	agentPod, err := r.findAgentPodOnNode(ctx, targetPod.Spec.NodeName)
+	if err != nil || agentPod == nil {
+		logger.Info("No PAI agent pod found on node", "node", targetPod.Spec.NodeName)
+		return ""
+	}
+
+	// With hostPID, the agent pod can see all host processes at /host/proc.
+	// Find the container's PID by grepping cgroup files for the containerID.
+	// The script finds PIDs whose cgroup contains the containerID, then reads their cmdline.
+	script := fmt.Sprintf(
+		`for pid in $(ls /host/proc/ 2>/dev/null | grep -E '^[0-9]+$'); do `+
+			`if cat /host/proc/$pid/cgroup 2>/dev/null | grep -q '%s'; then `+
+			`cat /host/proc/$pid/cmdline 2>/dev/null | tr '\0' ' '; echo; break; fi; done`,
+		containerID[:12], // use first 12 chars of containerID (sufficient for matching)
+	)
+
+	stdout, err := r.execInPod(ctx, agentPod.Name, agentPod.Namespace, "agent", []string{"sh", "-c", script})
+	if err != nil {
+		logger.Info("Failed to exec in agent pod", "error", err, "agentPod", agentPod.Name)
+		return ""
+	}
+
+	cmdline := strings.ToLower(strings.TrimSpace(stdout))
+	if cmdline == "" {
+		return ""
+	}
+
+	logger.Info("Agent read process cmdline", "targetPod", targetPod.Name, "cmdline", cmdline)
+
+	for _, lang := range languages {
+		switch lang {
+		case "java":
+			if strings.Contains(cmdline, "java") {
+				return "java"
+			}
+		case "nodejs":
+			if strings.Contains(cmdline, "node") {
+				return "nodejs"
+			}
+		case "python":
+			if strings.Contains(cmdline, "python") {
+				return "python"
+			}
+		case "dotnet":
+			if strings.Contains(cmdline, "dotnet") {
+				return "dotnet"
+			}
 		}
 	}
-	return false
+
+	return ""
+}
+
+// findAgentPodOnNode returns a running PAI agent pod on the given node
+func (r *ParseableConfigReconciler) findAgentPodOnNode(ctx context.Context, nodeName string) (*corev1.Pod, error) {
+	podList := &corev1.PodList{}
+	if err := r.List(ctx, podList,
+		client.InNamespace(otelOperatorNamespace),
+		client.MatchingLabels{"app.kubernetes.io/name": "pai-agent"},
+	); err != nil {
+		return nil, err
+	}
+	for i := range podList.Items {
+		pod := &podList.Items[i]
+		if pod.Spec.NodeName == nodeName && pod.Status.Phase == corev1.PodRunning && isPodReady(pod) {
+			return pod, nil
+		}
+	}
+	return nil, nil
 }
 
 // findRunningPods returns up to maxPods running, ready pods for the given workload.
