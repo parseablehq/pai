@@ -6,23 +6,46 @@ metadata:
     app.kubernetes.io/managed-by: kustomize
   name: production
 spec:
-  namespaceSelector:
-    mode: include
-    namespaces:
-      - demo
-
   target:
     endpoint: http://106.51.126.91:8010
     credentialsSecret:
       name: parseable-creds
       namespace: parseable-operator-system
-    streams:
-      traces: prod-traces-demo-new
 
-  instrumentation:
-    languages:
-      - java
-      - python
-      - nodejs
-      - dotnet
-    detectionTimeout: "1m"
+  traces:
+    stream: pai-traces
+    namespaceSelector:
+      mode: include
+      namespaces:
+        - demo
+    instrumentation:
+      languages:
+        - java
+        - python
+        - nodejs
+        - dotnet
+      detectionTimeout: "1m"
+
+  logs:
+    stream: pai-logs
+    namespaceSelector:
+      mode: include
+      namespaces:
+        - demo
+
+  metrics:
+    stream: pai-metrics
+    namespaceSelector:
+      mode: include
+      namespaces:
+        - demo
+    nodeMetrics:
+      enabled: true
+
+  events:
+    enabled: true
+    stream: pai-events
+    namespaceSelector:
+      mode: include
+      namespaces:
+        - demo

@@ -51,10 +51,13 @@ func (p GenericPredicates) ignoreNamespace(obj client.Object) bool {
 	}
 
 	for _, config := range configs.Items {
-		if config.Spec.NamespaceSelector.Mode != "exclude" {
+		if config.Spec.Traces == nil {
 			continue
 		}
-		for _, ns := range config.Spec.NamespaceSelector.Namespaces {
+		if config.Spec.Traces.NamespaceSelector.Mode != "exclude" {
+			continue
+		}
+		for _, ns := range config.Spec.Traces.NamespaceSelector.Namespaces {
 			if obj.GetNamespace() == ns {
 				msg := fmt.Sprintf("Pai operator will not reconcile namespace [%s], update namespaceSelector to reconcile", obj.GetNamespace())
 				log.Log.Info(msg)

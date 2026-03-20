@@ -17,7 +17,6 @@ limitations under the License.
 package v1alpha1
 
 import (
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -40,28 +39,13 @@ type SecretReference struct {
 	Namespace string `json:"namespace"`
 }
 
-// StreamConfig defines the stream names for different telemetry types
-type StreamConfig struct {
-	// Logs is the stream name for log data
-	Logs string `json:"logs,omitempty"`
-
-	// Traces is the stream name for trace data
-	Traces string `json:"traces,omitempty"`
-
-	// Metrics is the stream name for metric data
-	Metrics string `json:"metrics,omitempty"`
-}
-
-// TargetConfig defines the Parseable target endpoint configuration
+// TargetConfig defines the global Parseable target endpoint configuration
 type TargetConfig struct {
 	// Endpoint is the Parseable API endpoint URL for ingestion
 	Endpoint string `json:"endpoint"`
 
 	// CredentialsSecret references the secret containing authentication credentials
 	CredentialsSecret SecretReference `json:"credentialsSecret"`
-
-	// Streams defines the stream names for different telemetry types
-	Streams StreamConfig `json:"streams,omitempty"`
 }
 
 // InstrumentationConfig defines auto-instrumentation settings
@@ -70,62 +54,9 @@ type InstrumentationConfig struct {
 	// +kubebuilder:validation:Items:Enum=java;python;nodejs;dotnet;go
 	Languages []string `json:"languages,omitempty"`
 
-	// DetectionTimeout is how long (e.g. "60s", "2m") to wait for spans per language attempt during auto-detection.
+	// DetectionTimeout is how long (e.g. "60s", "2m") to wait during auto-detection.
 	// Defaults to "1m" if not set.
 	DetectionTimeout string `json:"detectionTimeout,omitempty"`
-}
-
-// LogEnrichment defines log enrichment options
-type LogEnrichment struct {
-	// KubernetesMetadata enables enriching logs with Kubernetes metadata
-	KubernetesMetadata bool `json:"kubernetesMetadata,omitempty"`
-}
-
-// LogsConfig defines logging configuration
-type LogsConfig struct {
-	// Enabled specifies whether log collection is enabled
-	Enabled bool `json:"enabled,omitempty"`
-
-	// Collector specifies the log collector to use
-	Collector string `json:"collector,omitempty"`
-
-	// Enrichment defines log enrichment options
-	Enrichment LogEnrichment `json:"enrichment,omitempty"`
-}
-
-// NodeMetricsConfig defines node-level metrics collection
-type NodeMetricsConfig struct {
-	// Enabled specifies whether node metrics collection is enabled
-	Enabled bool `json:"enabled,omitempty"`
-
-	// ScrapeInterval is the interval at which to scrape metrics
-	ScrapeInterval string `json:"scrapeInterval,omitempty"`
-
-	// Collectors specifies which metric collectors to enable
-	// +kubebuilder:validation:Items:Enum=cpu;memory;disk;network
-	Collectors []string `json:"collectors,omitempty"`
-}
-
-// KubernetesEventsConfig defines Kubernetes event collection
-type KubernetesEventsConfig struct {
-	// Enabled specifies whether Kubernetes event collection is enabled
-	Enabled bool `json:"enabled,omitempty"`
-
-	// EventTypes specifies which event types to collect
-	// +kubebuilder:validation:Items:Enum=Normal;Warning
-	EventTypes []string `json:"eventTypes,omitempty"`
-}
-
-// DaemonSetResources defines resources for DaemonSet workloads
-type DaemonSetResources struct {
-	// Limits describes the maximum amount of compute resources allowed
-	Limits corev1.ResourceList `json:"limits,omitempty"`
-}
-
-// ResourcesConfig defines resource configurations for operator-managed workloads
-type ResourcesConfig struct {
-	// DaemonSet defines resources for DaemonSet workloads
-	DaemonSet DaemonSetResources `json:"daemonSet,omitempty"`
 }
 
 // WorkloadSelector defines which workloads to include or exclude by labels
@@ -138,34 +69,76 @@ type WorkloadSelector struct {
 	metav1.LabelSelector `json:",inline"`
 }
 
-// ParseableConfigSpec defines the desired state of ParseableConfig
-type ParseableConfigSpec struct {
-	// NamespaceSelector defines which namespaces to include or exclude from instrumentation
+// TracesConfig defines tracing configuration
+type TracesConfig struct {
+	// Stream is the Parseable stream name for trace data
+	Stream string `json:"stream"`
+
+	// NamespaceSelector defines which namespaces to target for tracing
 	NamespaceSelector NamespaceSelector `json:"namespaceSelector,omitempty"`
 
-	// WorkloadSelector defines which workloads to include or exclude by labels.
-	// In "include" mode, only workloads with ALL matching labels are instrumented.
-	// In "exclude" mode, workloads with ALL matching labels are skipped.
-	// If not set, all workloads in selected namespaces are instrumented.
+	// WorkloadSelector defines which workloads to include or exclude by labels
 	WorkloadSelector *WorkloadSelector `json:"workloadSelector,omitempty"`
 
-	// Target defines the Parseable endpoint configuration
+	// Instrumentation defines auto-instrumentation settings for traces
+	Instrumentation InstrumentationConfig `json:"instrumentation,omitempty"`
+}
+
+// LogsConfig defines logging configuration
+type LogsConfig struct {
+	// Stream is the Parseable stream name for log data
+	Stream string `json:"stream"`
+
+	// NamespaceSelector defines which namespaces to collect logs from
+	NamespaceSelector NamespaceSelector `json:"namespaceSelector,omitempty"`
+}
+
+// NodeMetricsConfig defines node-level metrics collection settings
+type NodeMetricsConfig struct {
+	// Enabled controls whether node metrics (CPU, memory, disk, network) are collected via kubeletstats
+	Enabled bool `json:"enabled,omitempty"`
+}
+
+// MetricsConfig defines metrics configuration
+type MetricsConfig struct {
+	// Stream is the Parseable stream name for metric data
+	Stream string `json:"stream"`
+
+	// NamespaceSelector defines which namespaces to collect metrics from
+	NamespaceSelector NamespaceSelector `json:"namespaceSelector,omitempty"`
+
+	// NodeMetrics controls collection of node-level metrics via kubeletstats receiver
+	NodeMetrics NodeMetricsConfig `json:"nodeMetrics,omitempty"`
+}
+
+// EventsConfig defines Kubernetes events collection configuration
+type EventsConfig struct {
+	// Enabled controls whether Kubernetes events are collected
+	Enabled bool `json:"enabled"`
+
+	// Stream is the Parseable stream name for event data
+	Stream string `json:"stream,omitempty"`
+
+	// NamespaceSelector defines which namespaces to collect events from
+	NamespaceSelector NamespaceSelector `json:"namespaceSelector,omitempty"`
+}
+
+// ParseableConfigSpec defines the desired state of ParseableConfig
+type ParseableConfigSpec struct {
+	// Target defines the global Parseable endpoint and credentials
 	Target TargetConfig `json:"target"`
 
-	// Instrumentation defines auto-instrumentation settings
-	Instrumentation InstrumentationConfig `json:"instrumentation,omitempty"`
+	// Traces defines tracing configuration
+	Traces *TracesConfig `json:"traces,omitempty"`
 
 	// Logs defines logging configuration
-	Logs LogsConfig `json:"logs,omitempty"`
+	Logs *LogsConfig `json:"logs,omitempty"`
 
-	// NodeMetrics defines node-level metrics collection settings
-	NodeMetrics NodeMetricsConfig `json:"nodeMetrics,omitempty"`
+	// Metrics defines metrics configuration
+	Metrics *MetricsConfig `json:"metrics,omitempty"`
 
-	// KubernetesEvents defines Kubernetes event collection settings
-	KubernetesEvents KubernetesEventsConfig `json:"kubernetesEvents,omitempty"`
-
-	// Resources defines resource configurations for operator-managed workloads
-	Resources ResourcesConfig `json:"resources,omitempty"`
+	// Events defines Kubernetes events collection configuration
+	Events *EventsConfig `json:"events,omitempty"`
 }
 
 // WorkloadInstrumentationStatus tracks the detection result for a single workload

@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"fmt"
@@ -26,6 +27,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -33,7 +35,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/remotecommand"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -49,20 +53,29 @@ const (
 	otelOperatorRepoName  = "open-telemetry"
 	otelOperatorRepoURL   = "https://open-telemetry.github.io/opentelemetry-helm-charts"
 	otelOperatorChartRef  = "open-telemetry/opentelemetry-operator"
-	sidecarCollectorName  = "pai-sidecar"
 	instrumentationName   = "pai-instrumentation"
 
-	sidecarAnnotation          = "sidecar.opentelemetry.io/inject"
-	sidecarAnnotationValue     = otelOperatorNamespace + "/" + sidecarCollectorName
+	// kept for cleanup of legacy sidecar resources
+	sidecarCollectorName = "pai-sidecar"
+	sidecarAnnotation    = "sidecar.opentelemetry.io/inject"
+
+	logCollectorName         = "pai-log-collector"
+	metricsEventsCollectorName = "pai-metrics-events-collector"
+	collectorClusterRoleName   = "pai-collector"
+
 	instrumentationAnnotPrefix = "instrumentation.opentelemetry.io/inject-"
 	instrumentationRefValue    = otelOperatorNamespace + "/" + instrumentationName
 
-	sidecarMetricsPort      = "8888"
-	metricsCheckMetric      = "otelcol_receiver_accepted_spans_total"
-	defaultDetectionTimeout = 1 * time.Minute
-
 	finalizerName = "observability.parseable.com/finalizer"
 )
+
+// language binary checks for exec-based detection
+var languageBinaryChecks = map[string][][]string{
+	"java":   {{"java", "-version"}},
+	"nodejs": {{"node", "--version"}},
+	"python": {{"python3", "--version"}, {"python", "--version"}},
+	"dotnet": {{"dotnet", "--version"}},
+}
 
 // auto-instrumentation images per language
 // Note: Go auto-instrumentation requires enabling a feature flag on the OTel operator
@@ -91,6 +104,8 @@ type ParseableConfigReconciler struct {
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=opentelemetry.io,resources=opentelemetrycollectors,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=opentelemetry.io,resources=instrumentations,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles;clusterrolebindings,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -138,21 +153,33 @@ func (r *ParseableConfigReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		return ctrl.Result{}, err
 	}
 
-	// Step 2: Ensure sidecar collector exists
-	if err := r.ensureSidecarCollector(ctx, config); err != nil {
-		logger.Error(err, "Failed to ensure sidecar collector")
-		return ctrl.Result{}, err
-	}
-
-	// Step 3: Ensure Instrumentation CR exists for configured languages
+	// Step 2: Ensure Instrumentation CR exists (sends traces directly to Parseable)
 	if err := r.ensureInstrumentation(ctx, config); err != nil {
 		logger.Error(err, "Failed to ensure Instrumentation CR")
 		return ctrl.Result{}, err
 	}
 
-	// Step 4: Annotate deployments and statefulsets in reconciled namespaces
+	// Step 3: Detect languages via exec and annotate workloads (single rollout per workload)
 	if err := r.ensureAnnotations(ctx, config); err != nil {
 		logger.Error(err, "Failed to ensure annotations")
+		return ctrl.Result{}, err
+	}
+
+	// Step 4: Ensure collector RBAC (ClusterRole + bindings for collector ServiceAccounts)
+	if err := r.ensureCollectorRBAC(ctx); err != nil {
+		logger.Error(err, "Failed to ensure collector RBAC")
+		return ctrl.Result{}, err
+	}
+
+	// Step 5: Ensure log collector DaemonSet if logs are enabled
+	if err := r.ensureLogCollector(ctx, config); err != nil {
+		logger.Error(err, "Failed to ensure log collector")
+		return ctrl.Result{}, err
+	}
+
+	// Step 6: Ensure metrics+events collector Deployment
+	if err := r.ensureMetricsEventsCollector(ctx, config); err != nil {
+		logger.Error(err, "Failed to ensure metrics/events collector")
 		return ctrl.Result{}, err
 	}
 
@@ -239,126 +266,137 @@ func (r *ParseableConfigReconciler) ensureOtelOperator(ctx context.Context) erro
 	}
 }
 
-// ensureSidecarCollector creates the OpenTelemetryCollector sidecar CR if it does not exist
-func (r *ParseableConfigReconciler) ensureSidecarCollector(ctx context.Context, config *observabilityv1alpha1.ParseableConfig) error {
+// ensureCollectorRBAC creates a ClusterRole and ClusterRoleBindings for collector ServiceAccounts.
+// The k8s_cluster, k8sobjects, and kubeletstats receivers need permissions to list/watch cluster resources.
+func (r *ParseableConfigReconciler) ensureCollectorRBAC(ctx context.Context) error {
 	logger := log.FromContext(ctx)
 
-	// Check if the sidecar collector already exists
-	existing := &unstructured.Unstructured{}
-	existing.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "opentelemetry.io",
-		Version: "v1beta1",
-		Kind:    "OpenTelemetryCollector",
-	})
-
-	err := r.Get(ctx, client.ObjectKey{Name: sidecarCollectorName, Namespace: otelOperatorNamespace}, existing)
-	if err == nil {
-		logger.Info("Sidecar collector already exists, skipping")
-		return nil
+	// Create or update ClusterRole
+	role := &rbacv1.ClusterRole{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: collectorClusterRoleName,
+		},
+		Rules: []rbacv1.PolicyRule{
+			{
+				APIGroups: []string{""},
+				Resources: []string{"events", "namespaces", "namespaces/status", "nodes", "nodes/spec", "nodes/stats", "nodes/proxy",
+					"pods", "pods/status", "replicationcontrollers", "replicationcontrollers/status",
+					"resourcequotas", "services"},
+				Verbs: []string{"get", "list", "watch"},
+			},
+			{
+				APIGroups: []string{"apps"},
+				Resources: []string{"daemonsets", "deployments", "replicasets", "statefulsets"},
+				Verbs: []string{"get", "list", "watch"},
+			},
+			{
+				APIGroups: []string{"batch"},
+				Resources: []string{"jobs", "cronjobs"},
+				Verbs: []string{"get", "list", "watch"},
+			},
+			{
+				APIGroups: []string{"autoscaling"},
+				Resources: []string{"horizontalpodautoscalers"},
+				Verbs: []string{"get", "list", "watch"},
+			},
+		},
 	}
-	if !errors.IsNotFound(err) {
-		return fmt.Errorf("failed to check sidecar collector: %w", err)
+
+	existing := &rbacv1.ClusterRole{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(role), existing); err != nil {
+		if errors.IsNotFound(err) {
+			if err := r.Create(ctx, role); err != nil {
+				return fmt.Errorf("failed to create ClusterRole: %w", err)
+			}
+			logger.Info("ClusterRole created", "name", collectorClusterRoleName)
+		} else {
+			return err
+		}
+	} else {
+		existing.Rules = role.Rules
+		if err := r.Update(ctx, existing); err != nil {
+			return fmt.Errorf("failed to update ClusterRole: %w", err)
+		}
 	}
 
+	// Bind each collector ServiceAccount (OTel operator auto-creates them as <collector-name>-collector)
+	serviceAccounts := []string{
+		logCollectorName + "-collector",
+		metricsEventsCollectorName + "-collector",
+	}
+
+	for _, sa := range serviceAccounts {
+		binding := &rbacv1.ClusterRoleBinding{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "pai-" + sa,
+			},
+			RoleRef: rbacv1.RoleRef{
+				APIGroup: "rbac.authorization.k8s.io",
+				Kind:     "ClusterRole",
+				Name:     collectorClusterRoleName,
+			},
+			Subjects: []rbacv1.Subject{
+				{
+					Kind:      "ServiceAccount",
+					Name:      sa,
+					Namespace: otelOperatorNamespace,
+				},
+			},
+		}
+
+		existingBinding := &rbacv1.ClusterRoleBinding{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(binding), existingBinding); err != nil {
+			if errors.IsNotFound(err) {
+				if err := r.Create(ctx, binding); err != nil {
+					return fmt.Errorf("failed to create ClusterRoleBinding for %s: %w", sa, err)
+				}
+				logger.Info("ClusterRoleBinding created", "serviceAccount", sa)
+			} else {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// buildInstrumentationSpec builds the Instrumentation spec that sends traces directly to Parseable
+func (r *ParseableConfigReconciler) buildInstrumentationSpec(ctx context.Context, config *observabilityv1alpha1.ParseableConfig) (map[string]interface{}, error) {
 	// Read credentials secret
 	secret := &corev1.Secret{}
 	secretRef := config.Spec.Target.CredentialsSecret
 	if err := r.Get(ctx, client.ObjectKey{Name: secretRef.Name, Namespace: secretRef.Namespace}, secret); err != nil {
-		return fmt.Errorf("failed to read credentials secret %s/%s: %w", secretRef.Namespace, secretRef.Name, err)
+		return nil, fmt.Errorf("failed to read credentials secret %s/%s: %w", secretRef.Namespace, secretRef.Name, err)
 	}
 
 	username := string(secret.Data["username"])
 	password := string(secret.Data["password"])
 	basicAuth := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", username, password)))
 
-	// Derive TLS insecure from endpoint scheme
-	endpoint := config.Spec.Target.Endpoint
-	tlsInsecure := !strings.HasPrefix(endpoint, "https")
+	tracesStream := config.Spec.Traces.Stream
+	endpoint := strings.TrimRight(config.Spec.Target.Endpoint, "/")
 
-	// Build collector config
-	tracesStream := config.Spec.Target.Streams.Traces
-	tracesEndpoint := strings.TrimRight(endpoint, "/") + "/v1/traces"
-
-	// Build the OpenTelemetryCollector CR
-	collector := &unstructured.Unstructured{
-		Object: map[string]interface{}{
-			"apiVersion": "opentelemetry.io/v1beta1",
-			"kind":       "OpenTelemetryCollector",
-			"metadata": map[string]interface{}{
-				"name":      sidecarCollectorName,
-				"namespace": otelOperatorNamespace,
-			},
-			"spec": map[string]interface{}{
-				"mode": "sidecar",
-				"config": map[string]interface{}{
-					"receivers": map[string]interface{}{
-						"otlp": map[string]interface{}{
-							"protocols": map[string]interface{}{
-								"grpc": map[string]interface{}{},
-								"http": map[string]interface{}{},
-							},
-						},
-					},
-					"processors": map[string]interface{}{
-						"batch": map[string]interface{}{},
-					},
-					"exporters": map[string]interface{}{
-						"debug": map[string]interface{}{},
-						"otlphttp/traces": map[string]interface{}{
-							"compression": "gzip",
-							"encoding":    "json",
-							"headers": map[string]interface{}{
-								"Authorization":  fmt.Sprintf("Basic %s", basicAuth),
-								"X-P-Log-Source": "otel-traces",
-								"X-P-Stream":     tracesStream,
-							},
-							"traces_endpoint": tracesEndpoint,
-							"retry_on_failure": map[string]interface{}{
-								"enabled":          true,
-								"initial_interval": "5s",
-								"max_interval":     "30s",
-							},
-							"timeout": "30s",
-							"tls": map[string]interface{}{
-								"insecure": tlsInsecure,
-							},
-						},
-					},
-					"service": map[string]interface{}{
-						"pipelines": map[string]interface{}{
-							"traces": map[string]interface{}{
-								"receivers":  []interface{}{"otlp"},
-								"processors": []interface{}{"batch"},
-								"exporters":  []interface{}{"otlphttp/traces", "debug"},
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-
-	if err := r.Create(ctx, collector); err != nil {
-		return fmt.Errorf("failed to create sidecar collector: %w", err)
-	}
-
-	logger.Info("Sidecar collector created successfully", "name", sidecarCollectorName, "namespace", otelOperatorNamespace)
-	return nil
-}
-
-// buildInstrumentationSpec builds the Instrumentation spec from the ParseableConfig
-func (r *ParseableConfigReconciler) buildInstrumentationSpec(config *observabilityv1alpha1.ParseableConfig) map[string]interface{} {
 	spec := map[string]interface{}{
 		"exporter": map[string]interface{}{
-			"endpoint": "http://localhost:4318",
+			"endpoint": endpoint,
 		},
 		"propagators": []interface{}{
 			"tracecontext",
 			"baggage",
 		},
+		"env": []interface{}{
+			map[string]interface{}{
+				"name":  "OTEL_EXPORTER_OTLP_PROTOCOL",
+				"value": "http/protobuf",
+			},
+			map[string]interface{}{
+				"name":  "OTEL_EXPORTER_OTLP_HEADERS",
+				"value": fmt.Sprintf("Authorization=Basic %s,X-P-Log-Source=otel-traces,X-P-Stream=%s", basicAuth, tracesStream),
+			},
+		},
 	}
 
-	for _, lang := range config.Spec.Instrumentation.Languages {
+	for _, lang := range config.Spec.Traces.Instrumentation.Languages {
 		image, ok := languageImages[lang]
 		if !ok {
 			continue
@@ -368,14 +406,14 @@ func (r *ParseableConfigReconciler) buildInstrumentationSpec(config *observabili
 		}
 	}
 
-	return spec
+	return spec, nil
 }
 
 // ensureInstrumentation creates or updates the Instrumentation CR with language sections based on the ParseableConfig
 func (r *ParseableConfigReconciler) ensureInstrumentation(ctx context.Context, config *observabilityv1alpha1.ParseableConfig) error {
 	logger := log.FromContext(ctx)
 
-	if len(config.Spec.Instrumentation.Languages) == 0 {
+	if config.Spec.Traces == nil || len(config.Spec.Traces.Instrumentation.Languages) == 0 {
 		logger.Info("No languages configured, skipping Instrumentation CR")
 		return nil
 	}
@@ -392,7 +430,10 @@ func (r *ParseableConfigReconciler) ensureInstrumentation(ctx context.Context, c
 		return fmt.Errorf("failed to check Instrumentation CR: %w", err)
 	}
 
-	spec := r.buildInstrumentationSpec(config)
+	spec, specErr := r.buildInstrumentationSpec(ctx, config)
+	if specErr != nil {
+		return specErr
+	}
 
 	if err == nil {
 		// Update existing CR with current languages
@@ -400,12 +441,12 @@ func (r *ParseableConfigReconciler) ensureInstrumentation(ctx context.Context, c
 		if err := r.Update(ctx, existing); err != nil {
 			return fmt.Errorf("failed to update Instrumentation CR: %w", err)
 		}
-		logger.Info("Instrumentation CR updated", "languages", config.Spec.Instrumentation.Languages)
+		logger.Info("Instrumentation CR updated", "languages", config.Spec.Traces.Instrumentation.Languages)
 		return nil
 	}
 
 	// Create new
-	logger.Info("Creating Instrumentation CR", "languages", config.Spec.Instrumentation.Languages)
+	logger.Info("Creating Instrumentation CR", "languages", config.Spec.Traces.Instrumentation.Languages)
 	instrumentation := &unstructured.Unstructured{
 		Object: map[string]interface{}{
 			"apiVersion": "opentelemetry.io/v1alpha1",
@@ -424,6 +465,458 @@ func (r *ParseableConfigReconciler) ensureInstrumentation(ctx context.Context, c
 
 	logger.Info("Instrumentation CR created successfully", "name", instrumentationName, "namespace", otelOperatorNamespace)
 	return nil
+}
+
+// ensureLogCollector creates or updates a DaemonSet-mode OpenTelemetryCollector CR for log collection.
+// If logs are not configured, it deletes any existing log collector.
+func (r *ParseableConfigReconciler) ensureLogCollector(ctx context.Context, config *observabilityv1alpha1.ParseableConfig) error {
+	logger := log.FromContext(ctx)
+
+	gvk := schema.GroupVersionKind{
+		Group:   "opentelemetry.io",
+		Version: "v1beta1",
+		Kind:    "OpenTelemetryCollector",
+	}
+
+	existing := &unstructured.Unstructured{}
+	existing.SetGroupVersionKind(gvk)
+	err := r.Get(ctx, client.ObjectKey{Name: logCollectorName, Namespace: otelOperatorNamespace}, existing)
+
+	// If logs not configured, clean up any existing collector and return
+	if config.Spec.Logs == nil || config.Spec.Logs.Stream == "" {
+		if err == nil {
+			logger.Info("Logs not configured, deleting log collector")
+			if delErr := r.Delete(ctx, existing); delErr != nil && !errors.IsNotFound(delErr) {
+				return fmt.Errorf("failed to delete log collector: %w", delErr)
+			}
+		}
+		return nil
+	}
+
+	collectorConfig, cfgErr := r.buildLogCollectorConfig(ctx, config)
+	if cfgErr != nil {
+		return cfgErr
+	}
+
+	spec := map[string]interface{}{
+		"mode":   "daemonset",
+		"config": collectorConfig,
+		"volumes": []interface{}{
+			map[string]interface{}{
+				"name": "varlogpods",
+				"hostPath": map[string]interface{}{
+					"path": "/var/log/pods",
+				},
+			},
+		},
+		"volumeMounts": []interface{}{
+			map[string]interface{}{
+				"name":      "varlogpods",
+				"mountPath": "/var/log/pods",
+				"readOnly":  true,
+			},
+		},
+	}
+
+	if err == nil {
+		// Update existing
+		existing.Object["spec"] = spec
+		if updErr := r.Update(ctx, existing); updErr != nil {
+			return fmt.Errorf("failed to update log collector: %w", updErr)
+		}
+		logger.Info("Log collector updated")
+		return nil
+	}
+
+	if !errors.IsNotFound(err) {
+		return fmt.Errorf("failed to check log collector: %w", err)
+	}
+
+	// Create new
+	logger.Info("Creating log collector DaemonSet")
+	collector := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "opentelemetry.io/v1beta1",
+			"kind":       "OpenTelemetryCollector",
+			"metadata": map[string]interface{}{
+				"name":      logCollectorName,
+				"namespace": otelOperatorNamespace,
+			},
+			"spec": spec,
+		},
+	}
+
+	if crErr := r.Create(ctx, collector); crErr != nil {
+		return fmt.Errorf("failed to create log collector: %w", crErr)
+	}
+
+	logger.Info("Log collector created successfully")
+	return nil
+}
+
+// buildLogCollectorConfig builds the OTel collector pipeline config YAML for log collection.
+// It uses the filelog receiver with include/exclude patterns based on the namespace selector,
+// k8sattributes processor for metadata enrichment, and otlphttp exporter for Parseable.
+func (r *ParseableConfigReconciler) buildLogCollectorConfig(ctx context.Context, config *observabilityv1alpha1.ParseableConfig) (map[string]interface{}, error) {
+	logs := config.Spec.Logs
+
+	// Build filelog include/exclude patterns from namespace selector
+	var includePatterns, excludePatterns []interface{}
+
+	switch logs.NamespaceSelector.Mode {
+	case "include":
+		for _, ns := range logs.NamespaceSelector.Namespaces {
+			includePatterns = append(includePatterns, fmt.Sprintf("/var/log/pods/%s_*/*/*.log", ns))
+		}
+	case "exclude":
+		includePatterns = []interface{}{"/var/log/pods/*/*/*.log"}
+		for _, ns := range logs.NamespaceSelector.Namespaces {
+			excludePatterns = append(excludePatterns, fmt.Sprintf("/var/log/pods/%s_*/*/*.log", ns))
+		}
+	default:
+		// No selector — collect from all namespaces
+		includePatterns = []interface{}{"/var/log/pods/*/*/*.log"}
+	}
+
+	filelogReceiver := map[string]interface{}{
+		"include":           includePatterns,
+		"include_file_path": true,
+		"operators": []interface{}{
+			map[string]interface{}{
+				"type": "container",
+				"id":   "container-parser",
+			},
+		},
+	}
+	if len(excludePatterns) > 0 {
+		filelogReceiver["exclude"] = excludePatterns
+	}
+
+	// Read credentials for the exporter
+	secret := &corev1.Secret{}
+	secretRef := config.Spec.Target.CredentialsSecret
+	if err := r.Get(ctx, client.ObjectKey{Name: secretRef.Name, Namespace: secretRef.Namespace}, secret); err != nil {
+		return nil, fmt.Errorf("failed to read credentials secret %s/%s: %w", secretRef.Namespace, secretRef.Name, err)
+	}
+
+	username := string(secret.Data["username"])
+	password := string(secret.Data["password"])
+	basicAuth := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", username, password)))
+	endpoint := strings.TrimRight(config.Spec.Target.Endpoint, "/")
+
+	receivers := map[string]interface{}{
+		"filelog": filelogReceiver,
+	}
+	processors := map[string]interface{}{
+		"batch": map[string]interface{}{},
+		"k8sattributes": map[string]interface{}{
+			"extract": map[string]interface{}{
+				"metadata": []interface{}{
+					"k8s.namespace.name",
+					"k8s.pod.name",
+					"k8s.container.name",
+					"k8s.node.name",
+				},
+			},
+		},
+	}
+	exporters := map[string]interface{}{
+		"otlphttp/logs": map[string]interface{}{
+			"endpoint": endpoint,
+			"headers": map[string]interface{}{
+				"Authorization":  fmt.Sprintf("Basic %s", basicAuth),
+				"X-P-Log-Source": "otel-logs",
+				"X-P-Stream":    logs.Stream,
+			},
+		},
+	}
+	pipelines := map[string]interface{}{
+		"logs": map[string]interface{}{
+			"receivers":  []interface{}{"filelog"},
+			"processors": []interface{}{"k8sattributes", "batch"},
+			"exporters":  []interface{}{"otlphttp/logs"},
+		},
+	}
+
+	// Add kubeletstats metrics pipeline if nodeMetrics enabled (DaemonSet runs on every node)
+	if config.Spec.Metrics != nil && config.Spec.Metrics.NodeMetrics.Enabled && config.Spec.Metrics.Stream != "" {
+		receivers["kubeletstats"] = map[string]interface{}{
+			"collection_interval":  "30s",
+			"auth_type":            "serviceAccount",
+			"endpoint":             "https://${env:K8S_NODE_NAME}:10250",
+			"insecure_skip_verify": true,
+		}
+		exporters["otlphttp/nodemetrics"] = map[string]interface{}{
+			"endpoint": endpoint,
+			"headers": map[string]interface{}{
+				"Authorization":  fmt.Sprintf("Basic %s", basicAuth),
+				"X-P-Log-Source": "otel-metrics",
+				"X-P-Stream":    config.Spec.Metrics.Stream,
+			},
+		}
+		pipelines["metrics"] = map[string]interface{}{
+			"receivers":  []interface{}{"kubeletstats"},
+			"processors": []interface{}{"batch"},
+			"exporters":  []interface{}{"otlphttp/nodemetrics"},
+		}
+	}
+
+	collectorConfig := map[string]interface{}{
+		"receivers":  receivers,
+		"processors": processors,
+		"exporters":  exporters,
+		"service": map[string]interface{}{
+			"pipelines": pipelines,
+		},
+	}
+
+	return collectorConfig, nil
+}
+
+// ensureMetricsEventsCollector creates or updates a single Deployment-mode OpenTelemetryCollector CR
+// that handles both metrics (k8s_cluster) and events (k8sobjects) as separate pipelines.
+// If neither metrics nor events are configured, it deletes any existing collector.
+func (r *ParseableConfigReconciler) ensureMetricsEventsCollector(ctx context.Context, config *observabilityv1alpha1.ParseableConfig) error {
+	logger := log.FromContext(ctx)
+
+	gvk := schema.GroupVersionKind{
+		Group:   "opentelemetry.io",
+		Version: "v1beta1",
+		Kind:    "OpenTelemetryCollector",
+	}
+
+	existing := &unstructured.Unstructured{}
+	existing.SetGroupVersionKind(gvk)
+	err := r.Get(ctx, client.ObjectKey{Name: metricsEventsCollectorName, Namespace: otelOperatorNamespace}, existing)
+
+	metricsEnabled := config.Spec.Metrics != nil && config.Spec.Metrics.Stream != ""
+	eventsEnabled := config.Spec.Events != nil && config.Spec.Events.Enabled && config.Spec.Events.Stream != ""
+
+	if !metricsEnabled && !eventsEnabled {
+		if err == nil {
+			logger.Info("Neither metrics nor events configured, deleting collector")
+			if delErr := r.Delete(ctx, existing); delErr != nil && !errors.IsNotFound(delErr) {
+				return fmt.Errorf("failed to delete metrics/events collector: %w", delErr)
+			}
+		}
+		return nil
+	}
+
+	collectorConfig, cfgErr := r.buildMetricsEventsCollectorConfig(ctx, config, metricsEnabled, eventsEnabled)
+	if cfgErr != nil {
+		return cfgErr
+	}
+
+	spec := map[string]interface{}{
+		"mode":   "deployment",
+		"config": collectorConfig,
+	}
+
+	if err == nil {
+		existing.Object["spec"] = spec
+		if updErr := r.Update(ctx, existing); updErr != nil {
+			return fmt.Errorf("failed to update metrics/events collector: %w", updErr)
+		}
+		logger.Info("Metrics/events collector updated", "metrics", metricsEnabled, "events", eventsEnabled)
+		return nil
+	}
+
+	if !errors.IsNotFound(err) {
+		return fmt.Errorf("failed to check metrics/events collector: %w", err)
+	}
+
+	logger.Info("Creating metrics/events collector Deployment", "metrics", metricsEnabled, "events", eventsEnabled)
+	collector := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "opentelemetry.io/v1beta1",
+			"kind":       "OpenTelemetryCollector",
+			"metadata": map[string]interface{}{
+				"name":      metricsEventsCollectorName,
+				"namespace": otelOperatorNamespace,
+			},
+			"spec": spec,
+		},
+	}
+
+	if crErr := r.Create(ctx, collector); crErr != nil {
+		return fmt.Errorf("failed to create metrics/events collector: %w", crErr)
+	}
+
+	logger.Info("Metrics/events collector created successfully")
+	return nil
+}
+
+// buildMetricsEventsCollectorConfig builds a single OTel collector config with:
+//   - metrics pipeline: k8s_cluster → filter → batch → otlphttp/metrics
+//   - logs pipeline (events): k8sobjects → filter → batch → otlphttp/events
+//
+// Each pipeline has its own exporter with the correct stream/headers for Parseable.
+func (r *ParseableConfigReconciler) buildMetricsEventsCollectorConfig(
+	ctx context.Context,
+	config *observabilityv1alpha1.ParseableConfig,
+	metricsEnabled, eventsEnabled bool,
+) (map[string]interface{}, error) {
+
+	// Read credentials (shared by both pipelines)
+	secret := &corev1.Secret{}
+	secretRef := config.Spec.Target.CredentialsSecret
+	if err := r.Get(ctx, client.ObjectKey{Name: secretRef.Name, Namespace: secretRef.Namespace}, secret); err != nil {
+		return nil, fmt.Errorf("failed to read credentials secret %s/%s: %w", secretRef.Namespace, secretRef.Name, err)
+	}
+
+	username := string(secret.Data["username"])
+	password := string(secret.Data["password"])
+	basicAuth := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", username, password)))
+	endpoint := strings.TrimRight(config.Spec.Target.Endpoint, "/")
+
+	receivers := map[string]interface{}{}
+	processors := map[string]interface{}{
+		"batch": map[string]interface{}{},
+	}
+	exporters := map[string]interface{}{}
+	pipelines := map[string]interface{}{}
+
+	// --- Metrics pipeline ---
+	if metricsEnabled {
+		metrics := config.Spec.Metrics
+
+		receivers["k8s_cluster"] = map[string]interface{}{
+			"collection_interval": "30s",
+		}
+		metricsReceiverList := []interface{}{"k8s_cluster"}
+
+		metricsProcessorList := []interface{}{}
+
+		if len(metrics.NamespaceSelector.Namespaces) > 0 {
+			nsRegex := strings.Join(metrics.NamespaceSelector.Namespaces, "|")
+			switch metrics.NamespaceSelector.Mode {
+			case "include":
+				processors["filter/metrics_ns"] = map[string]interface{}{
+					"metrics": map[string]interface{}{
+						"include": map[string]interface{}{
+							"match_type": "regexp",
+							"resource_attributes": []interface{}{
+								map[string]interface{}{
+									"key":   "k8s.namespace.name",
+									"value": nsRegex,
+								},
+							},
+						},
+					},
+				}
+				metricsProcessorList = append(metricsProcessorList, "filter/metrics_ns")
+			case "exclude":
+				processors["filter/metrics_ns"] = map[string]interface{}{
+					"metrics": map[string]interface{}{
+						"exclude": map[string]interface{}{
+							"match_type": "regexp",
+							"resource_attributes": []interface{}{
+								map[string]interface{}{
+									"key":   "k8s.namespace.name",
+									"value": nsRegex,
+								},
+							},
+						},
+					},
+				}
+				metricsProcessorList = append(metricsProcessorList, "filter/metrics_ns")
+			}
+		}
+
+		metricsProcessorList = append(metricsProcessorList, "batch")
+
+		exporters["otlphttp/metrics"] = map[string]interface{}{
+			"endpoint": endpoint,
+			"headers": map[string]interface{}{
+				"Authorization":  fmt.Sprintf("Basic %s", basicAuth),
+				"X-P-Log-Source": "otel-metrics",
+				"X-P-Stream":    metrics.Stream,
+			},
+		}
+
+		pipelines["metrics"] = map[string]interface{}{
+			"receivers":  metricsReceiverList,
+			"processors": metricsProcessorList,
+			"exporters":  []interface{}{"otlphttp/metrics"},
+		}
+	}
+
+	// --- Events pipeline (logs signal) ---
+	if eventsEnabled {
+		events := config.Spec.Events
+
+		eventsObj := map[string]interface{}{
+			"name": "events",
+			"mode": "watch",
+		}
+
+		// k8sobjects receiver supports namespaces filter for include mode
+		if len(events.NamespaceSelector.Namespaces) > 0 && events.NamespaceSelector.Mode == "include" {
+			eventsObj["namespaces"] = toInterfaceSlice(events.NamespaceSelector.Namespaces)
+		}
+
+		receivers["k8sobjects"] = map[string]interface{}{
+			"objects": []interface{}{eventsObj},
+		}
+
+		eventsProcessorList := []interface{}{}
+
+		// Exclude mode uses filter processor
+		if len(events.NamespaceSelector.Namespaces) > 0 && events.NamespaceSelector.Mode == "exclude" {
+			nsRegex := strings.Join(events.NamespaceSelector.Namespaces, "|")
+			processors["filter/events_ns"] = map[string]interface{}{
+				"logs": map[string]interface{}{
+					"exclude": map[string]interface{}{
+						"match_type": "regexp",
+						"resource_attributes": []interface{}{
+							map[string]interface{}{
+								"key":   "k8s.namespace.name",
+								"value": nsRegex,
+							},
+						},
+					},
+				},
+			}
+			eventsProcessorList = append(eventsProcessorList, "filter/events_ns")
+		}
+
+		eventsProcessorList = append(eventsProcessorList, "batch")
+
+		exporters["otlphttp/events"] = map[string]interface{}{
+			"endpoint": endpoint,
+			"headers": map[string]interface{}{
+				"Authorization":  fmt.Sprintf("Basic %s", basicAuth),
+				"X-P-Log-Source": "otel-logs",
+				"X-P-Stream":    events.Stream,
+			},
+		}
+
+		pipelines["logs"] = map[string]interface{}{
+			"receivers":  []interface{}{"k8sobjects"},
+			"processors": eventsProcessorList,
+			"exporters":  []interface{}{"otlphttp/events"},
+		}
+	}
+
+	collectorConfig := map[string]interface{}{
+		"receivers":  receivers,
+		"processors": processors,
+		"exporters":  exporters,
+		"service": map[string]interface{}{
+			"pipelines": pipelines,
+		},
+	}
+
+	return collectorConfig, nil
+}
+
+// toInterfaceSlice converts []string to []interface{} for unstructured maps
+func toInterfaceSlice(ss []string) []interface{} {
+	out := make([]interface{}, len(ss))
+	for i, s := range ss {
+		out[i] = s
+	}
+	return out
 }
 
 // workloadKey returns a unique key for a workload (kind/namespace/name)
@@ -515,15 +1008,13 @@ func (r *ParseableConfigReconciler) updateWorkloadStatus(ctx context.Context, co
 	}
 }
 
-// ensureAnnotations filters workloads by selector and status, then runs
-// detectLanguage in parallel for each unprocessed workload.
-// detectLanguage sets both sidecar + language annotations in one shot (single rollout per attempt).
-// If no language matches, sidecar annotation is removed to revert to original state.
+// ensureAnnotations filters workloads by selector and status, then detects
+// language via exec and adds the instrumentation annotation (single rollout per workload).
 // Workloads already processed (tracked in status) at current generation are skipped.
 func (r *ParseableConfigReconciler) ensureAnnotations(ctx context.Context, config *observabilityv1alpha1.ParseableConfig) error {
 	logger := log.FromContext(ctx)
 
-	if len(config.Spec.Instrumentation.Languages) == 0 {
+	if config.Spec.Traces == nil || len(config.Spec.Traces.Instrumentation.Languages) == 0 {
 		logger.Info("No languages configured, skipping annotation")
 		return nil
 	}
@@ -562,8 +1053,8 @@ func (r *ParseableConfigReconciler) ensureAnnotations(ctx context.Context, confi
 	}
 
 	// Apply workload selector filter
-	if config.Spec.WorkloadSelector != nil {
-		selector, err := metav1.LabelSelectorAsSelector(&config.Spec.WorkloadSelector.LabelSelector)
+	if config.Spec.Traces.WorkloadSelector != nil {
+		selector, err := metav1.LabelSelectorAsSelector(&config.Spec.Traces.WorkloadSelector.LabelSelector)
 		if err != nil {
 			return fmt.Errorf("invalid workloadSelector: %w", err)
 		}
@@ -571,7 +1062,7 @@ func (r *ParseableConfigReconciler) ensureAnnotations(ctx context.Context, confi
 		var filtered []client.Object
 		for _, obj := range allWorkloads {
 			matches := selector.Matches(labels.Set(obj.GetLabels()))
-			switch config.Spec.WorkloadSelector.Mode {
+			switch config.Spec.Traces.WorkloadSelector.Mode {
 			case "include":
 				if matches {
 					filtered = append(filtered, obj)
@@ -612,9 +1103,8 @@ func (r *ParseableConfigReconciler) ensureAnnotations(ctx context.Context, confi
 		return nil
 	}
 
-	// Language detection for all workloads in parallel
-	// detectLanguage sets both sidecar + language annotations in one shot (single rollout per attempt)
-	logger.Info("Starting language detection in parallel", "workloads", len(needsDetection))
+	// Detect language via exec and instrument workloads in parallel
+	logger.Info("Starting exec-based language detection", "workloads", len(needsDetection))
 	var wg sync.WaitGroup
 	for _, obj := range needsDetection {
 		wg.Add(1)
@@ -670,7 +1160,28 @@ func (r *ParseableConfigReconciler) cleanup(ctx context.Context, config *observa
 		logger.Info("Instrumentation CR deleted")
 	}
 
-	// Step 3: Delete Sidecar Collector CR
+	// Step 3: Delete Log Collector CR
+	logger.Info("Deleting Log Collector CR", "name", logCollectorName, "namespace", otelOperatorNamespace)
+	logCollector := &unstructured.Unstructured{}
+	logCollector.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "opentelemetry.io",
+		Version: "v1beta1",
+		Kind:    "OpenTelemetryCollector",
+	})
+	logCollector.SetName(logCollectorName)
+	logCollector.SetNamespace(otelOperatorNamespace)
+	if err := r.Delete(ctx, logCollector); err != nil {
+		if !errors.IsNotFound(err) {
+			logger.Error(err, "Failed to delete Log Collector CR")
+		}
+	} else {
+		logger.Info("Log Collector CR deleted")
+	}
+
+	// Step 4: Delete Metrics/Events Collector CR
+	r.deleteCollectorCR(ctx, metricsEventsCollectorName)
+
+	// Step 5: Delete Sidecar Collector CR (legacy)
 	logger.Info("Deleting Sidecar Collector CR", "name", sidecarCollectorName, "namespace", otelOperatorNamespace)
 	collector := &unstructured.Unstructured{}
 	collector.SetGroupVersionKind(schema.GroupVersionKind{
@@ -713,6 +1224,26 @@ func (r *ParseableConfigReconciler) cleanup(ctx context.Context, config *observa
 	}
 
 	return nil
+}
+
+// deleteCollectorCR deletes an OpenTelemetryCollector CR by name, ignoring NotFound
+func (r *ParseableConfigReconciler) deleteCollectorCR(ctx context.Context, name string) {
+	logger := log.FromContext(ctx)
+	obj := &unstructured.Unstructured{}
+	obj.SetGroupVersionKind(schema.GroupVersionKind{
+		Group:   "opentelemetry.io",
+		Version: "v1beta1",
+		Kind:    "OpenTelemetryCollector",
+	})
+	obj.SetName(name)
+	obj.SetNamespace(otelOperatorNamespace)
+	if err := r.Delete(ctx, obj); err != nil {
+		if !errors.IsNotFound(err) {
+			logger.Error(err, "Failed to delete collector CR", "name", name)
+		}
+	} else {
+		logger.Info("Collector CR deleted", "name", name)
+	}
 }
 
 // removeAnnotationsFromNamespace removes sidecar and instrumentation annotations from all workloads in a namespace
@@ -759,11 +1290,13 @@ func (r *ParseableConfigReconciler) removeWorkloadAnnotations(ctx context.Contex
 		delete(annotations, sidecarAnnotation)
 		changed = true
 	}
-	for _, lang := range config.Spec.Instrumentation.Languages {
-		key := instrumentationAnnotPrefix + lang
-		if _, ok := annotations[key]; ok {
-			delete(annotations, key)
-			changed = true
+	if config.Spec.Traces != nil {
+		for _, lang := range config.Spec.Traces.Instrumentation.Languages {
+			key := instrumentationAnnotPrefix + lang
+			if _, ok := annotations[key]; ok {
+				delete(annotations, key)
+				changed = true
+			}
 		}
 	}
 
@@ -781,9 +1314,13 @@ func (r *ParseableConfigReconciler) removeWorkloadAnnotations(ctx context.Contex
 
 // getReconciledNamespaces returns the list of namespaces the operator should reconcile
 func (r *ParseableConfigReconciler) getReconciledNamespaces(ctx context.Context, config *observabilityv1alpha1.ParseableConfig) ([]string, error) {
+	if config.Spec.Traces == nil {
+		return nil, nil
+	}
+
 	// Include mode: return only the listed namespaces
-	if config.Spec.NamespaceSelector.Mode == "include" {
-		return config.Spec.NamespaceSelector.Namespaces, nil
+	if config.Spec.Traces.NamespaceSelector.Mode == "include" {
+		return config.Spec.Traces.NamespaceSelector.Namespaces, nil
 	}
 
 	// Exclude mode: return all namespaces except the listed ones
@@ -793,7 +1330,7 @@ func (r *ParseableConfigReconciler) getReconciledNamespaces(ctx context.Context,
 	}
 
 	excludeSet := make(map[string]bool)
-	for _, ns := range config.Spec.NamespaceSelector.Namespaces {
+	for _, ns := range config.Spec.Traces.NamespaceSelector.Namespaces {
 		excludeSet[ns] = true
 	}
 
@@ -850,137 +1387,156 @@ func (s *statefulSetWorkload) getPodSelector() labels.Selector {
 	return sel
 }
 
-// detectLanguage tries language annotations one by one on a workload that already has a sidecar.
-// For each language, it adds the annotation, waits for rollout, and polls sidecar metrics
-// for the configured detectionTimeout. If no language matches, it removes the sidecar annotation.
+// detectLanguage detects the workload's language by exec-ing into a running pod,
+// then adds the correct instrumentation annotation (single rollout).
 func (r *ParseableConfigReconciler) detectLanguage(ctx context.Context, config *observabilityv1alpha1.ParseableConfig, obj client.Object) error {
 	logger := log.FromContext(ctx)
 
-	detectionTimeout := defaultDetectionTimeout
-	if config.Spec.Instrumentation.DetectionTimeout != "" {
-		if parsed, err := time.ParseDuration(config.Spec.Instrumentation.DetectionTimeout); err == nil {
-			detectionTimeout = parsed
-		} else {
-			logger.Error(err, "Invalid detectionTimeout, using default", "value", config.Spec.Instrumentation.DetectionTimeout)
-		}
+	w := r.wrapWorkload(obj)
+
+	// Find a running pod for this workload
+	pod, err := r.findRunningPod(ctx, w)
+	if err != nil || pod == nil {
+		logger.Info("No running pod found, skipping detection", "name", obj.GetName(), "namespace", obj.GetNamespace())
+		return nil
 	}
 
-	for _, lang := range config.Spec.Instrumentation.Languages {
-		key := instrumentationAnnotPrefix + lang
+	containerName := pod.Spec.Containers[0].Name
+	lang := r.detectLanguageByExec(ctx, pod.Name, pod.Namespace, containerName, config.Spec.Traces.Instrumentation.Languages)
 
-		logger.Info("Trying language annotation", "name", obj.GetName(), "namespace", obj.GetNamespace(), "language", lang)
+	if lang == "" {
+		logger.Info("No language detected", "name", obj.GetName(), "namespace", obj.GetNamespace())
+		r.updateWorkloadStatus(ctx, config, obj, "", false)
+		return nil
+	}
 
-		// Retry on conflict since multiple goroutines may be updating concurrently
-		var existingPods map[string]bool
-		var updateErr error
-		for retry := 0; retry < 5; retry++ {
-			if err := r.Get(ctx, client.ObjectKeyFromObject(obj), obj); err != nil {
-				return fmt.Errorf("failed to re-fetch workload: %w", err)
-			}
-			w := r.wrapWorkload(obj)
-			annotations := w.getPodTemplateAnnotations()
-			if annotations == nil {
-				annotations = make(map[string]string)
-			}
+	logger.Info("Language detected via exec", "name", obj.GetName(), "namespace", obj.GetNamespace(), "language", lang)
 
-			for _, l := range config.Spec.Instrumentation.Languages {
-				delete(annotations, instrumentationAnnotPrefix+l)
-			}
-			annotations[sidecarAnnotation] = sidecarAnnotationValue
-			annotations[key] = instrumentationRefValue
-			w.setPodTemplateAnnotations(annotations)
+	// Add instrumentation annotation (single rollout)
+	key := instrumentationAnnotPrefix + lang
+	for retry := 0; retry < 5; retry++ {
+		if err := r.Get(ctx, client.ObjectKeyFromObject(obj), obj); err != nil {
+			return fmt.Errorf("failed to re-fetch workload: %w", err)
+		}
+		w := r.wrapWorkload(obj)
+		annotations := w.getPodTemplateAnnotations()
+		if annotations == nil {
+			annotations = make(map[string]string)
+		}
+		annotations[key] = instrumentationRefValue
+		w.setPodTemplateAnnotations(annotations)
 
-			existingPods = r.getExistingPodNames(ctx, w)
-			updateErr = r.Update(ctx, obj)
-			if updateErr == nil {
-				break
-			}
-			if errors.IsConflict(updateErr) {
-				logger.Info("Conflict on update, retrying", "name", obj.GetName(), "language", lang, "retry", retry+1)
+		if err := r.Update(ctx, obj); err != nil {
+			if errors.IsConflict(err) {
+				logger.Info("Conflict on update, retrying", "name", obj.GetName(), "retry", retry+1)
 				time.Sleep(time.Duration(retry+1) * time.Second)
 				continue
 			}
-			return fmt.Errorf("failed to update workload %s/%s with language %s: %w", obj.GetNamespace(), obj.GetName(), lang, updateErr)
+			return fmt.Errorf("failed to annotate workload %s/%s: %w", obj.GetNamespace(), obj.GetName(), err)
 		}
-		if updateErr != nil {
-			return fmt.Errorf("failed to update workload %s/%s with language %s after retries: %w", obj.GetNamespace(), obj.GetName(), lang, updateErr)
+		break
+	}
+
+	r.updateWorkloadStatus(ctx, config, obj, lang, true)
+	return nil
+}
+
+// findRunningPod returns a running, ready pod for the given workload
+func (r *ParseableConfigReconciler) findRunningPod(ctx context.Context, w workload) (*corev1.Pod, error) {
+	podList := &corev1.PodList{}
+	if err := r.List(ctx, podList, client.InNamespace(w.GetNamespace()), client.MatchingLabelsSelector{Selector: w.getPodSelector()}); err != nil {
+		return nil, err
+	}
+	for i := range podList.Items {
+		pod := &podList.Items[i]
+		if pod.DeletionTimestamp == nil && pod.Status.Phase == corev1.PodRunning && isPodReady(pod) {
+			return pod, nil
 		}
+	}
+	return nil, nil
+}
 
-		w := r.wrapWorkload(obj)
+// detectLanguageByExec detects the language runtime by exec-ing into the container.
+// First tries reading /proc/1/cmdline, then falls back to checking if language binaries exist.
+// Distroless containers (no shell/cat) will return empty — these are typically Go or Native AOT
+// builds that don't support auto-instrumentation anyway.
+func (r *ParseableConfigReconciler) detectLanguageByExec(ctx context.Context, podName, namespace, containerName string, languages []string) string {
+	logger := log.FromContext(ctx)
 
-		// Wait for rollout and get pod name
-		podName, err := r.waitForRollout(ctx, w, existingPods)
-		if err != nil {
-			logger.Error(err, "Rollout wait failed", "name", obj.GetName(), "language", lang)
-			continue
-		}
+	// Phase 1: Try reading the main process cmdline
+	stdout, err := r.execInPod(ctx, podName, namespace, containerName, []string{"cat", "/proc/1/cmdline"})
+	if err == nil {
+		cmdline := strings.ToLower(strings.ReplaceAll(stdout, "\x00", " "))
+		logger.Info("Read process cmdline", "pod", podName, "cmdline", cmdline)
 
-		// Poll sidecar metrics for detectionTimeout, checking every 10s
-		logger.Info("Waiting for spans", "pod", podName, "namespace", obj.GetNamespace(), "language", lang, "timeout", detectionTimeout)
-		deadline := time.After(detectionTimeout)
-		ticker := time.NewTicker(10 * time.Second)
-		detected := false
-
-		func() {
-			defer ticker.Stop()
-			for {
-				select {
-				case <-deadline:
-					return
-				case <-ticker.C:
-					metrics, err := r.fetchSidecarMetrics(ctx, podName, obj.GetNamespace())
-					if err != nil {
-						logger.Error(err, "Failed to fetch sidecar metrics", "pod", podName, "language", lang)
-						continue
-					}
-					if checkSidecarHasSpans(metrics) {
-						detected = true
-						return
-					}
-				case <-ctx.Done():
-					return
+		for _, lang := range languages {
+			switch lang {
+			case "java":
+				if strings.Contains(cmdline, "java") {
+					return "java"
+				}
+			case "nodejs":
+				if strings.Contains(cmdline, "node") {
+					return "nodejs"
+				}
+			case "python":
+				if strings.Contains(cmdline, "python") {
+					return "python"
+				}
+			case "dotnet":
+				if strings.Contains(cmdline, "dotnet") {
+					return "dotnet"
 				}
 			}
-		}()
-
-		if detected {
-			logger.Info("Language detected", "name", obj.GetName(), "namespace", obj.GetNamespace(), "language", lang)
-			r.updateWorkloadStatus(ctx, config, obj, lang, true)
-			return nil
 		}
-
-		logger.Info("No spans detected, trying next language", "name", obj.GetName(), "language", lang)
 	}
 
-	// No language matched — remove sidecar annotation to revert to original
-	logger.Info("No language matched, reverting to original state", "name", obj.GetName(), "namespace", obj.GetNamespace())
-	r.updateWorkloadStatus(ctx, config, obj, "", false)
-	for retry := 0; retry < 5; retry++ {
-		if err := r.Get(ctx, client.ObjectKeyFromObject(obj), obj); err != nil {
-			return err
-		}
-		rw := r.wrapWorkload(obj)
-		annotations := rw.getPodTemplateAnnotations()
-		if annotations == nil {
-			return nil
-		}
-		delete(annotations, sidecarAnnotation)
-		for _, lang := range config.Spec.Instrumentation.Languages {
-			delete(annotations, instrumentationAnnotPrefix+lang)
-		}
-		rw.setPodTemplateAnnotations(annotations)
-		err := r.Update(ctx, obj)
-		if err == nil {
-			logger.Info("Workload reverted to original state", "name", obj.GetName(), "namespace", obj.GetNamespace())
-			return nil
-		}
-		if errors.IsConflict(err) {
-			time.Sleep(time.Duration(retry+1) * time.Second)
+	// Phase 2: Check if language binaries exist
+	for _, lang := range languages {
+		checks, ok := languageBinaryChecks[lang]
+		if !ok {
 			continue
 		}
-		return fmt.Errorf("failed to revert workload to original: %w", err)
+		for _, cmd := range checks {
+			if _, err := r.execInPod(ctx, podName, namespace, containerName, cmd); err == nil {
+				logger.Info("Language binary found", "pod", podName, "language", lang, "binary", cmd[0])
+				return lang
+			}
+		}
 	}
-	return fmt.Errorf("failed to revert workload %s/%s after retries", obj.GetNamespace(), obj.GetName())
+
+	return ""
+}
+
+// execInPod executes a command in a container and returns stdout
+func (r *ParseableConfigReconciler) execInPod(ctx context.Context, podName, namespace, containerName string, command []string) (string, error) {
+	req := r.Clientset.CoreV1().RESTClient().Post().
+		Resource("pods").
+		Name(podName).
+		Namespace(namespace).
+		SubResource("exec").
+		VersionedParams(&corev1.PodExecOptions{
+			Container: containerName,
+			Command:   command,
+			Stdout:    true,
+			Stderr:    true,
+		}, scheme.ParameterCodec)
+
+	exec, err := remotecommand.NewSPDYExecutor(r.RestConfig, "POST", req.URL())
+	if err != nil {
+		return "", err
+	}
+
+	var stdout, stderr bytes.Buffer
+	err = exec.StreamWithContext(ctx, remotecommand.StreamOptions{
+		Stdout: &stdout,
+		Stderr: &stderr,
+	})
+	if err != nil {
+		return "", err
+	}
+
+	return stdout.String(), nil
 }
 
 // wrapWorkload wraps a client.Object into the workload interface
@@ -994,47 +1550,6 @@ func (r *ParseableConfigReconciler) wrapWorkload(obj client.Object) workload {
 	return nil
 }
 
-// waitForRollout waits for a NEW pod (not in oldPods) to be running with the sidecar
-// and returns the pod name. Does not require the pod to be fully ready —
-// the detection polling loop handles readiness via metrics checks.
-func (r *ParseableConfigReconciler) waitForRollout(ctx context.Context, w workload, oldPods map[string]bool) (string, error) {
-	timeout := time.After(5 * time.Minute)
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-timeout:
-			return "", fmt.Errorf("timed out waiting for rollout of %s/%s", w.GetNamespace(), w.GetName())
-		case <-ticker.C:
-			podList := &corev1.PodList{}
-			if err := r.List(ctx, podList, client.InNamespace(w.GetNamespace()), client.MatchingLabelsSelector{Selector: w.getPodSelector()}); err != nil {
-				continue
-			}
-			for _, pod := range podList.Items {
-				if pod.DeletionTimestamp != nil || oldPods[pod.Name] {
-					continue
-				}
-				if pod.Status.Phase == corev1.PodRunning && hasSidecarInitContainer(&pod) {
-					return pod.Name, nil
-				}
-			}
-		case <-ctx.Done():
-			return "", ctx.Err()
-		}
-	}
-}
-
-// hasSidecarInitContainer checks if the pod has the otc-container sidecar init container
-func hasSidecarInitContainer(pod *corev1.Pod) bool {
-	for _, c := range pod.Spec.InitContainers {
-		if c.Name == "otc-container" {
-			return true
-		}
-	}
-	return false
-}
-
 // isPodReady checks if all containers in a pod are ready
 func isPodReady(pod *corev1.Pod) bool {
 	for _, c := range pod.Status.ContainerStatuses {
@@ -1043,35 +1558,6 @@ func isPodReady(pod *corev1.Pod) bool {
 		}
 	}
 	return len(pod.Status.ContainerStatuses) > 0
-}
-
-// getExistingPodNames returns the names of currently existing pods for the workload
-func (r *ParseableConfigReconciler) getExistingPodNames(ctx context.Context, w workload) map[string]bool {
-	podList := &corev1.PodList{}
-	names := make(map[string]bool)
-	if err := r.List(ctx, podList, client.InNamespace(w.GetNamespace()), client.MatchingLabelsSelector{Selector: w.getPodSelector()}); err != nil {
-		return names
-	}
-	for _, pod := range podList.Items {
-		names[pod.Name] = true
-	}
-	return names
-}
-
-// fetchSidecarMetrics fetches metrics from the sidecar's /metrics endpoint
-// Uses the Kubernetes pod proxy API which works both locally and in-cluster
-func (r *ParseableConfigReconciler) fetchSidecarMetrics(ctx context.Context, podName, namespace string) (string, error) {
-	result := r.Clientset.CoreV1().Pods(namespace).ProxyGet("http", podName, sidecarMetricsPort, "/metrics", nil)
-	body, err := result.DoRaw(ctx)
-	if err != nil {
-		return "", fmt.Errorf("failed to proxy get metrics from pod %s/%s: %w", namespace, podName, err)
-	}
-	return string(body), nil
-}
-
-// checkSidecarHasSpans checks if the sidecar metrics contain accepted spans
-func checkSidecarHasSpans(metricsBody string) bool {
-	return strings.Contains(metricsBody, metricsCheckMetric)
 }
 
 // SetupWithManager sets up the controller with the Manager.

@@ -1,100 +1,111 @@
-# pai
-// TODO(user): Add simple overview of use/purpose
+# PAI - Parseable Auto Instrumentation
 
-## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+PAI is a Kubernetes operator that automatically instruments your workloads with OpenTelemetry and sends traces to Parseable.
 
-## Getting Started
+## Prerequisites
 
-### Prerequisites
-- go version v1.22.0+
-- docker version 17.03+.
-- kubectl version v1.11.3+.
-- Access to a Kubernetes v1.11.3+ cluster.
+- Kubernetes cluster (1.24+)
+- Helm 3
+- kubectl
 
-### To Deploy on the cluster
-**Build and push your image to the location specified by `IMG`:**
+## Install
 
-```sh
-make docker-build docker-push IMG=<some-registry>/pai:tag
+### 1. Add Helm repo
+
+```bash
+helm repo add parseable https://charts.parseable.com
+helm repo update
 ```
 
-**NOTE:** This image ought to be published in the personal registry you specified.
-And it is required to have access to pull the image from the working environment.
-Make sure you have the proper permission to the registry if the above commands don’t work.
+### 2. Install PAI operator
 
-**Install the CRDs into the cluster:**
-
-```sh
-make install
+```bash
+helm install pai parseable/pai -n pai-system --create-namespace
 ```
 
-**Deploy the Manager to the cluster with the image specified by `IMG`:**
+### 3. Create credentials secret
 
-```sh
-make deploy IMG=<some-registry>/pai:tag
+Create a secret with your Parseable credentials in the namespace where the operator is running.
+
+```bash
+kubectl create secret generic parseable-creds \
+  --namespace pai-system \
+  --from-literal=username=<your-username> \
+  --from-literal=password=<your-password>
 ```
 
-> **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
-privileges or be logged in as admin.
+### 4. Apply ParseableConfig CR
 
-**Create instances of your solution**
-You can apply the samples (examples) from the config/sample:
+Create a file `parseableconfig.yaml`:
 
-```sh
-kubectl apply -k config/samples/
+```yaml
+apiVersion: observability.parseable.com/v1alpha1
+kind: ParseableConfig
+metadata:
+  name: production
+spec:
+  namespaceSelector:
+    mode: include
+    namespaces:
+      - default
+
+  target:
+    endpoint: https://24c6f9a9-9513-43b2-a83f-bbf3149fc06c-ingestor.workspace.parseable.com
+    credentialsSecret:
+      name: parseable-creds
+      namespace: pai-system
+    streams:
+      traces: k8s-traces
+
+  instrumentation:
+    languages:
+      - java
+      - python
+      - nodejs
+      - dotnet
+    detectionTimeout: "1m"
 ```
 
->**NOTE**: Ensure that the samples has default values to test it out.
+Apply it:
 
-### To Uninstall
-**Delete the instances (CRs) from the cluster:**
-
-```sh
-kubectl delete -k config/samples/
+```bash
+kubectl apply -f parseableconfig.yaml
 ```
 
-**Delete the APIs(CRDs) from the cluster:**
+## What happens next
 
-```sh
-make uninstall
+1. PAI installs the OpenTelemetry operator automatically
+2. Creates a sidecar collector and instrumentation CRs
+3. Detects languages for each workload in the target namespace
+4. Injects OTel sidecar + auto-instrumentation into matching workloads
+5. Traces start flowing to your Parseable instance
+
+## Check status
+
+```bash
+kubectl get parseableconfig production -o yaml
 ```
 
-**UnDeploy the controller from the cluster:**
+The `status.workloads` field shows which workloads were instrumented and their detected language.
 
-```sh
-make undeploy
+## Workload Selector (optional)
+
+To instrument only specific workloads, add a `workloadSelector`:
+
+```yaml
+spec:
+  workloadSelector:
+    mode: include
+    matchLabels:
+      app: my-service
 ```
 
-## Project Distribution
+## Uninstall
 
-Following are the steps to build the installer and distribute this project to users.
-
-1. Build the installer for the image built and published in the registry:
-
-```sh
-make build-installer IMG=<some-registry>/pai:tag
+```bash
+kubectl delete parseableconfig production
+helm uninstall pai -n pai-system
 ```
-
-NOTE: The makefile target mentioned above generates an 'install.yaml'
-file in the dist directory. This file contains all the resources built
-with Kustomize, which are necessary to install this project without
-its dependencies.
-
-2. Using the installer
-
-Users can just run kubectl apply -f <URL for YAML BUNDLE> to install the project, i.e.:
-
-```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/pai/<tag or branch>/dist/install.yaml
-```
-
-## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
-
-**NOTE:** Run `make help` for more information on all potential `make` targets
-
-More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html)
 
 ## License
 
@@ -111,4 +122,3 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
-
