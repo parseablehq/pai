@@ -43,14 +43,12 @@ spec:
             namespaces: [demo]    # from events.namespaceSelector (include mode)
 
     processors:
-      # Namespace filter for metrics — only if metrics.namespaceSelector is set
+      # Namespace filter for metrics (OTTL syntax) — only if metrics.namespaceSelector is set
       filter/metrics_ns:
+        error_mode: ignore
         metrics:
-          include:
-            match_type: regexp
-            resource_attributes:
-              - key: k8s.namespace.name
-                value: "demo"
+          datapoint:
+            - 'resource.attributes["k8s.namespace.name"] == nil or not IsMatch(resource.attributes["k8s.namespace.name"], "^(demo)$")'
       batch: {}
 
     exporters:

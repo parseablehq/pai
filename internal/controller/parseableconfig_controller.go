@@ -810,34 +810,26 @@ func (r *ParseableConfigReconciler) buildMetricsEventsCollectorConfig(
 
 		if len(metrics.NamespaceSelector.Namespaces) > 0 {
 			nsRegex := strings.Join(metrics.NamespaceSelector.Namespaces, "|")
+			var condition string
 			switch metrics.NamespaceSelector.Mode {
 			case "include":
-				processors["filter/metrics_ns"] = map[string]interface{}{
-					"metrics": map[string]interface{}{
-						"include": map[string]interface{}{
-							"match_type": "regexp",
-							"resource_attributes": []interface{}{
-								map[string]interface{}{
-									"key":   "k8s.namespace.name",
-									"value": nsRegex,
-								},
-							},
-						},
-					},
-				}
-				metricsProcessorList = append(metricsProcessorList, "filter/metrics_ns")
+				// Drop metrics where namespace is missing or doesn't match the allowed list
+				condition = fmt.Sprintf(
+					`resource.attributes["k8s.namespace.name"] == nil or not IsMatch(resource.attributes["k8s.namespace.name"], "^(%s)$")`,
+					nsRegex,
+				)
 			case "exclude":
+				// Drop metrics where namespace matches the excluded list
+				condition = fmt.Sprintf(
+					`IsMatch(resource.attributes["k8s.namespace.name"], "^(%s)$")`,
+					nsRegex,
+				)
+			}
+			if condition != "" {
 				processors["filter/metrics_ns"] = map[string]interface{}{
+					"error_mode": "ignore",
 					"metrics": map[string]interface{}{
-						"exclude": map[string]interface{}{
-							"match_type": "regexp",
-							"resource_attributes": []interface{}{
-								map[string]interface{}{
-									"key":   "k8s.namespace.name",
-									"value": nsRegex,
-								},
-							},
-						},
+						"datapoint": []interface{}{condition},
 					},
 				}
 				metricsProcessorList = append(metricsProcessorList, "filter/metrics_ns")
@@ -882,20 +874,17 @@ func (r *ParseableConfigReconciler) buildMetricsEventsCollectorConfig(
 
 		eventsProcessorList := []interface{}{}
 
-		// Exclude mode uses filter processor
+		// Exclude mode uses OTTL filter processor
 		if len(events.NamespaceSelector.Namespaces) > 0 && events.NamespaceSelector.Mode == "exclude" {
 			nsRegex := strings.Join(events.NamespaceSelector.Namespaces, "|")
+			condition := fmt.Sprintf(
+				`IsMatch(resource.attributes["k8s.namespace.name"], "^(%s)$")`,
+				nsRegex,
+			)
 			processors["filter/events_ns"] = map[string]interface{}{
+				"error_mode": "ignore",
 				"logs": map[string]interface{}{
-					"exclude": map[string]interface{}{
-						"match_type": "regexp",
-						"resource_attributes": []interface{}{
-							map[string]interface{}{
-								"key":   "k8s.namespace.name",
-								"value": nsRegex,
-							},
-						},
-					},
+					"log_record": []interface{}{condition},
 				},
 			}
 			eventsProcessorList = append(eventsProcessorList, "filter/events_ns")
