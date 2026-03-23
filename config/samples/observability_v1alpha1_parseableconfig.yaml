@@ -34,13 +34,14 @@ spec:
         - demo
 
   metrics:
-    stream: pai-metrics
-    namespaceSelector:
-      mode: include
-      namespaces:
-        - demo
+    podMetrics:
+      stream: pai-pod-metrics
+      namespaceSelector:
+        mode: include
+        namespaces:
+          - demo
     nodeMetrics:
-      enabled: true
+      stream: pai-node-metrics
 
   events:
     enabled: true

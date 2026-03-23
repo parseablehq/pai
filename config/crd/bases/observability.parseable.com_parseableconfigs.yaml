@@ -97,37 +97,62 @@ spec:
               metrics:
                 description: Metrics defines metrics configuration
                 properties:
-                  namespaceSelector:
-                    description: NamespaceSelector defines which namespaces to collect
-                      metrics from
-                    properties:
-                      mode:
-                        description: Mode specifies whether to include or exclude
-                          the listed namespaces
-                        enum:
-                        - include
-                        - exclude
-                        type: string
-                      namespaces:
-                        description: Namespaces is the list of namespace names
-                        items:
-                          type: string
-                        type: array
-                    type: object
                   nodeMetrics:
                     description: NodeMetrics controls collection of node-level metrics
                       via kubeletstats receiver
                     properties:
-                      enabled:
-                        description: Enabled controls whether node metrics (CPU, memory,
-                          disk, network) are collected via kubeletstats
-                        type: boolean
+                      namespaceSelector:
+                        description: NamespaceSelector defines which namespaces to
+                          collect node metrics from
+                        properties:
+                          mode:
+                            description: Mode specifies whether to include or exclude
+                              the listed namespaces
+                            enum:
+                            - include
+                            - exclude
+                            type: string
+                          namespaces:
+                            description: Namespaces is the list of namespace names
+                            items:
+                              type: string
+                            type: array
+                        type: object
+                      stream:
+                        description: Stream is the Parseable stream name for node
+                          metric data
+                        type: string
+                    required:
+                    - stream
                     type: object
-                  stream:
-                    description: Stream is the Parseable stream name for metric data
-                    type: string
-                required:
-                - stream
+                  podMetrics:
+                    description: PodMetrics controls collection of pod/container-level
+                      metrics via kubeletstats and k8s_cluster receivers
+                    properties:
+                      namespaceSelector:
+                        description: NamespaceSelector defines which namespaces to
+                          collect pod metrics from
+                        properties:
+                          mode:
+                            description: Mode specifies whether to include or exclude
+                              the listed namespaces
+                            enum:
+                            - include
+                            - exclude
+                            type: string
+                          namespaces:
+                            description: Namespaces is the list of namespace names
+                            items:
+                              type: string
+                            type: array
+                        type: object
+                      stream:
+                        description: Stream is the Parseable stream name for pod/container
+                          metric data
+                        type: string
+                    required:
+                    - stream
+                    type: object
                 type: object
               target:
                 description: Target defines the global Parseable endpoint and credentials

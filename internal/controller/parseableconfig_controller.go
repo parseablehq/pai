@@ -659,26 +659,94 @@ func (r *ParseableConfigReconciler) buildLogCollectorConfig(ctx context.Context,
 		},
 	}
 
-	// Add kubeletstats metrics pipeline if nodeMetrics enabled (DaemonSet runs on every node)
-	if config.Spec.Metrics != nil && config.Spec.Metrics.NodeMetrics.Enabled && config.Spec.Metrics.Stream != "" {
-		receivers["kubeletstats"] = map[string]interface{}{
-			"collection_interval":  "30s",
-			"auth_type":            "serviceAccount",
-			"endpoint":             "https://${env:K8S_NODE_NAME}:10250",
-			"insecure_skip_verify": true,
+	// Add kubeletstats metrics pipelines — split into node metrics and pod metrics on separate streams.
+	if config.Spec.Metrics != nil {
+		kubeletstatsAdded := false
+		addKubeletstats := func() {
+			if !kubeletstatsAdded {
+				receivers["kubeletstats"] = map[string]interface{}{
+					"collection_interval":  "30s",
+					"auth_type":            "serviceAccount",
+					"endpoint":             "https://${env:K8S_NODE_NAME}:10250",
+					"insecure_skip_verify": true,
+				}
+				kubeletstatsAdded = true
+			}
 		}
-		exporters["otlphttp/nodemetrics"] = map[string]interface{}{
-			"endpoint": endpoint,
-			"headers": map[string]interface{}{
-				"Authorization":  fmt.Sprintf("Basic %s", basicAuth),
-				"X-P-Log-Source": "otel-metrics",
-				"X-P-Stream":    config.Spec.Metrics.Stream,
-			},
+
+		// Node metrics pipeline → separate stream
+		if config.Spec.Metrics.NodeMetrics != nil && config.Spec.Metrics.NodeMetrics.Stream != "" {
+			addKubeletstats()
+			exporters["otlphttp/nodemetrics"] = map[string]interface{}{
+				"endpoint": endpoint,
+				"headers": map[string]interface{}{
+					"Authorization":  fmt.Sprintf("Basic %s", basicAuth),
+					"X-P-Log-Source": "otel-metrics",
+					"X-P-Stream":    config.Spec.Metrics.NodeMetrics.Stream,
+				},
+			}
+			// filter/node_only — keep only k8s.node.* metrics
+			processors["filter/node_only"] = map[string]interface{}{
+				"error_mode": "ignore",
+				"metrics": map[string]interface{}{
+					"metric": []interface{}{
+						`not IsMatch(name, "^k8s\\.node\\.")`,
+					},
+				},
+			}
+			pipelines["metrics/node"] = map[string]interface{}{
+				"receivers":  []interface{}{"kubeletstats"},
+				"processors": []interface{}{"filter/node_only", "batch"},
+				"exporters":  []interface{}{"otlphttp/nodemetrics"},
+			}
 		}
-		pipelines["metrics"] = map[string]interface{}{
-			"receivers":  []interface{}{"kubeletstats"},
-			"processors": []interface{}{"batch"},
-			"exporters":  []interface{}{"otlphttp/nodemetrics"},
+
+		// Pod metrics pipeline → separate stream, namespace-filtered
+		if config.Spec.Metrics.PodMetrics != nil && config.Spec.Metrics.PodMetrics.Stream != "" {
+			addKubeletstats()
+			exporters["otlphttp/podmetrics"] = map[string]interface{}{
+				"endpoint": endpoint,
+				"headers": map[string]interface{}{
+					"Authorization":  fmt.Sprintf("Basic %s", basicAuth),
+					"X-P-Log-Source": "otel-metrics",
+					"X-P-Stream":    config.Spec.Metrics.PodMetrics.Stream,
+				},
+			}
+			// filter/pod_only — drop k8s.node.* metrics, keep pod/container metrics
+			processors["filter/pod_only"] = map[string]interface{}{
+				"error_mode": "ignore",
+				"metrics": map[string]interface{}{
+					"metric": []interface{}{
+						`IsMatch(name, "^k8s\\.node\\.")`,
+					},
+				},
+			}
+			podProcessors := []interface{}{"filter/pod_only"}
+
+			// filter/pod_ns — filter pod metrics to configured namespaces
+			podNs := config.Spec.Metrics.PodMetrics.NamespaceSelector
+			if len(podNs.Namespaces) > 0 && podNs.Mode == "include" {
+				parts := make([]string, 0, len(podNs.Namespaces))
+				for _, ns := range podNs.Namespaces {
+					parts = append(parts, fmt.Sprintf(`resource.attributes["k8s.namespace.name"] != "%s"`, ns))
+				}
+				processors["filter/pod_ns"] = map[string]interface{}{
+					"error_mode": "ignore",
+					"metrics": map[string]interface{}{
+						"metric": []interface{}{
+							strings.Join(parts, " and "),
+						},
+					},
+				}
+				podProcessors = append(podProcessors, "filter/pod_ns")
+			}
+
+			podProcessors = append(podProcessors, "batch")
+			pipelines["metrics/pod"] = map[string]interface{}{
+				"receivers":  []interface{}{"kubeletstats"},
+				"processors": podProcessors,
+				"exporters":  []interface{}{"otlphttp/podmetrics"},
+			}
 		}
 	}
 
@@ -710,7 +778,7 @@ func (r *ParseableConfigReconciler) ensureMetricsEventsCollector(ctx context.Con
 	existing.SetGroupVersionKind(gvk)
 	err := r.Get(ctx, client.ObjectKey{Name: metricsEventsCollectorName, Namespace: otelOperatorNamespace}, existing)
 
-	metricsEnabled := config.Spec.Metrics != nil && config.Spec.Metrics.Stream != ""
+	metricsEnabled := config.Spec.Metrics != nil && config.Spec.Metrics.PodMetrics != nil && config.Spec.Metrics.PodMetrics.Stream != ""
 	eventsEnabled := config.Spec.Events != nil && config.Spec.Events.Enabled && config.Spec.Events.Stream != ""
 
 	if !metricsEnabled && !eventsEnabled {
@@ -797,43 +865,35 @@ func (r *ParseableConfigReconciler) buildMetricsEventsCollectorConfig(
 	exporters := map[string]interface{}{}
 	pipelines := map[string]interface{}{}
 
-	// --- Metrics pipeline ---
+	// --- Metrics pipeline (k8s_cluster receiver → podMetrics stream) ---
 	if metricsEnabled {
-		metrics := config.Spec.Metrics
+		podMetrics := config.Spec.Metrics.PodMetrics
 
-		receivers["k8s_cluster"] = map[string]interface{}{
+		k8sClusterCfg := map[string]interface{}{
 			"collection_interval": "30s",
 		}
-		metricsReceiverList := []interface{}{"k8s_cluster"}
+		// Use the receiver's native namespaces field to filter at source
+		if len(podMetrics.NamespaceSelector.Namespaces) > 0 && podMetrics.NamespaceSelector.Mode == "include" {
+			k8sClusterCfg["namespaces"] = toInterfaceSlice(podMetrics.NamespaceSelector.Namespaces)
+		}
+		receivers["k8s_cluster"] = k8sClusterCfg
 
 		metricsProcessorList := []interface{}{}
 
-		if len(metrics.NamespaceSelector.Namespaces) > 0 {
-			nsRegex := strings.Join(metrics.NamespaceSelector.Namespaces, "|")
-			var condition string
-			switch metrics.NamespaceSelector.Mode {
-			case "include":
-				// Drop metrics where namespace is missing or doesn't match the allowed list
-				condition = fmt.Sprintf(
-					`resource.attributes["k8s.namespace.name"] == nil or not IsMatch(resource.attributes["k8s.namespace.name"], "^(%s)$")`,
-					nsRegex,
-				)
-			case "exclude":
-				// Drop metrics where namespace matches the excluded list
-				condition = fmt.Sprintf(
-					`IsMatch(resource.attributes["k8s.namespace.name"], "^(%s)$")`,
-					nsRegex,
-				)
+		// Filter processor using OTTL metric context — drops metrics not in allowed namespaces
+		if len(podMetrics.NamespaceSelector.Namespaces) > 0 && podMetrics.NamespaceSelector.Mode == "include" {
+			parts := make([]string, 0, len(podMetrics.NamespaceSelector.Namespaces))
+			for _, ns := range podMetrics.NamespaceSelector.Namespaces {
+				parts = append(parts, fmt.Sprintf(`resource.attributes["k8s.namespace.name"] != "%s"`, ns))
 			}
-			if condition != "" {
-				processors["filter/metrics_ns"] = map[string]interface{}{
-					"error_mode": "ignore",
-					"metrics": map[string]interface{}{
-						"datapoint": []interface{}{condition},
-					},
-				}
-				metricsProcessorList = append(metricsProcessorList, "filter/metrics_ns")
+			condition := strings.Join(parts, " and ")
+			processors["filter/metrics_ns"] = map[string]interface{}{
+				"error_mode": "ignore",
+				"metrics": map[string]interface{}{
+					"metric": []interface{}{condition},
+				},
 			}
+			metricsProcessorList = append(metricsProcessorList, "filter/metrics_ns")
 		}
 
 		metricsProcessorList = append(metricsProcessorList, "batch")
@@ -843,12 +903,12 @@ func (r *ParseableConfigReconciler) buildMetricsEventsCollectorConfig(
 			"headers": map[string]interface{}{
 				"Authorization":  fmt.Sprintf("Basic %s", basicAuth),
 				"X-P-Log-Source": "otel-metrics",
-				"X-P-Stream":    metrics.Stream,
+				"X-P-Stream":    podMetrics.Stream,
 			},
 		}
 
 		pipelines["metrics"] = map[string]interface{}{
-			"receivers":  metricsReceiverList,
+			"receivers":  []interface{}{"k8s_cluster"},
 			"processors": metricsProcessorList,
 			"exporters":  []interface{}{"otlphttp/metrics"},
 		}
@@ -874,18 +934,15 @@ func (r *ParseableConfigReconciler) buildMetricsEventsCollectorConfig(
 
 		eventsProcessorList := []interface{}{}
 
-		// Exclude mode uses OTTL filter processor
+		// Exclude mode: drop logs matching excluded namespaces
 		if len(events.NamespaceSelector.Namespaces) > 0 && events.NamespaceSelector.Mode == "exclude" {
-			nsRegex := strings.Join(events.NamespaceSelector.Namespaces, "|")
-			condition := fmt.Sprintf(
-				`IsMatch(resource.attributes["k8s.namespace.name"], "^(%s)$")`,
-				nsRegex,
-			)
+			var conditions []interface{}
+			for _, ns := range events.NamespaceSelector.Namespaces {
+				conditions = append(conditions, fmt.Sprintf(`resource.attributes["k8s.namespace.name"] == "%s"`, ns))
+			}
 			processors["filter/events_ns"] = map[string]interface{}{
-				"error_mode": "ignore",
-				"logs": map[string]interface{}{
-					"log_record": []interface{}{condition},
-				},
+				"error_mode":     "ignore",
+				"log_conditions": conditions,
 			}
 			eventsProcessorList = append(eventsProcessorList, "filter/events_ns")
 		}

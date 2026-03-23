@@ -93,22 +93,31 @@ type LogsConfig struct {
 	NamespaceSelector NamespaceSelector `json:"namespaceSelector,omitempty"`
 }
 
+// PodMetricsConfig defines pod/container-level metrics collection settings
+type PodMetricsConfig struct {
+	// Stream is the Parseable stream name for pod/container metric data
+	Stream string `json:"stream"`
+
+	// NamespaceSelector defines which namespaces to collect pod metrics from
+	NamespaceSelector NamespaceSelector `json:"namespaceSelector,omitempty"`
+}
+
 // NodeMetricsConfig defines node-level metrics collection settings
 type NodeMetricsConfig struct {
-	// Enabled controls whether node metrics (CPU, memory, disk, network) are collected via kubeletstats
-	Enabled bool `json:"enabled,omitempty"`
+	// Stream is the Parseable stream name for node metric data
+	Stream string `json:"stream"`
+
+	// NamespaceSelector defines which namespaces to collect node metrics from
+	NamespaceSelector NamespaceSelector `json:"namespaceSelector,omitempty"`
 }
 
 // MetricsConfig defines metrics configuration
 type MetricsConfig struct {
-	// Stream is the Parseable stream name for metric data
-	Stream string `json:"stream"`
-
-	// NamespaceSelector defines which namespaces to collect metrics from
-	NamespaceSelector NamespaceSelector `json:"namespaceSelector,omitempty"`
+	// PodMetrics controls collection of pod/container-level metrics via kubeletstats and k8s_cluster receivers
+	PodMetrics *PodMetricsConfig `json:"podMetrics,omitempty"`
 
 	// NodeMetrics controls collection of node-level metrics via kubeletstats receiver
-	NodeMetrics NodeMetricsConfig `json:"nodeMetrics,omitempty"`
+	NodeMetrics *NodeMetricsConfig `json:"nodeMetrics,omitempty"`
 }
 
 // EventsConfig defines Kubernetes events collection configuration
