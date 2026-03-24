@@ -394,7 +394,7 @@ func (r *ParseableConfigReconciler) buildInstrumentationSpec(ctx context.Context
 	password := string(secret.Data["password"])
 	basicAuth := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", username, password)))
 
-	tracesStream := config.Spec.Traces.Stream
+	tracesStream := config.Spec.Traces.TargetDataset
 	endpoint := strings.TrimRight(config.Spec.Target.Endpoint, "/")
 
 	spec := map[string]interface{}{
@@ -504,7 +504,7 @@ func (r *ParseableConfigReconciler) ensureLogCollector(ctx context.Context, conf
 	err := r.Get(ctx, client.ObjectKey{Name: logCollectorName, Namespace: otelOperatorNamespace}, existing)
 
 	// If logs not configured, clean up any existing collector and return
-	if config.Spec.Logs == nil || config.Spec.Logs.Stream == "" {
+	if config.Spec.Logs == nil || config.Spec.Logs.TargetDataset == "" {
 		if err == nil {
 			logger.Info("Logs not configured, deleting log collector")
 			if delErr := r.Delete(ctx, existing); delErr != nil && !errors.IsNotFound(delErr) {
@@ -647,7 +647,7 @@ func (r *ParseableConfigReconciler) buildLogCollectorConfig(ctx context.Context,
 			"headers": map[string]interface{}{
 				"Authorization":  fmt.Sprintf("Basic %s", basicAuth),
 				"X-P-Log-Source": "otel-logs",
-				"X-P-Stream":     logs.Stream,
+				"X-P-Stream":     logs.TargetDataset,
 			},
 		},
 	}
@@ -675,14 +675,14 @@ func (r *ParseableConfigReconciler) buildLogCollectorConfig(ctx context.Context,
 		}
 
 		// Node metrics pipeline → separate stream
-		if config.Spec.Metrics.NodeMetrics != nil && config.Spec.Metrics.NodeMetrics.Stream != "" {
+		if config.Spec.Metrics.NodeMetrics != nil && config.Spec.Metrics.NodeMetrics.TargetDataset != "" {
 			addKubeletstats()
 			exporters["otlphttp/nodemetrics"] = map[string]interface{}{
 				"endpoint": endpoint,
 				"headers": map[string]interface{}{
 					"Authorization":  fmt.Sprintf("Basic %s", basicAuth),
 					"X-P-Log-Source": "otel-metrics",
-					"X-P-Stream":     config.Spec.Metrics.NodeMetrics.Stream,
+					"X-P-Stream":     config.Spec.Metrics.NodeMetrics.TargetDataset,
 				},
 			}
 			// filter/node_only — keep only k8s.node.* metrics
@@ -702,14 +702,14 @@ func (r *ParseableConfigReconciler) buildLogCollectorConfig(ctx context.Context,
 		}
 
 		// Pod metrics pipeline → separate stream, namespace-filtered
-		if config.Spec.Metrics.PodMetrics != nil && config.Spec.Metrics.PodMetrics.Stream != "" {
+		if config.Spec.Metrics.PodMetrics != nil && config.Spec.Metrics.PodMetrics.TargetDataset != "" {
 			addKubeletstats()
 			exporters["otlphttp/podmetrics"] = map[string]interface{}{
 				"endpoint": endpoint,
 				"headers": map[string]interface{}{
 					"Authorization":  fmt.Sprintf("Basic %s", basicAuth),
 					"X-P-Log-Source": "otel-metrics",
-					"X-P-Stream":     config.Spec.Metrics.PodMetrics.Stream,
+					"X-P-Stream":     config.Spec.Metrics.PodMetrics.TargetDataset,
 				},
 			}
 			// filter/pod_only — drop k8s.node.* metrics, keep pod/container metrics
@@ -795,8 +795,8 @@ func (r *ParseableConfigReconciler) ensureMetricsEventsCollector(ctx context.Con
 	existing.SetGroupVersionKind(gvk)
 	err := r.Get(ctx, client.ObjectKey{Name: metricsEventsCollectorName, Namespace: otelOperatorNamespace}, existing)
 
-	metricsEnabled := config.Spec.Metrics != nil && config.Spec.Metrics.PodMetrics != nil && config.Spec.Metrics.PodMetrics.Stream != ""
-	eventsEnabled := config.Spec.Events != nil && config.Spec.Events.Enabled && config.Spec.Events.Stream != ""
+	metricsEnabled := config.Spec.Metrics != nil && config.Spec.Metrics.PodMetrics != nil && config.Spec.Metrics.PodMetrics.TargetDataset != ""
+	eventsEnabled := config.Spec.Events != nil && config.Spec.Events.Enabled && config.Spec.Events.TargetDataset != ""
 
 	if !metricsEnabled && !eventsEnabled {
 		if err == nil {
@@ -920,7 +920,7 @@ func (r *ParseableConfigReconciler) buildMetricsEventsCollectorConfig(
 			"headers": map[string]interface{}{
 				"Authorization":  fmt.Sprintf("Basic %s", basicAuth),
 				"X-P-Log-Source": "otel-metrics",
-				"X-P-Stream":     podMetrics.Stream,
+				"X-P-Stream":     podMetrics.TargetDataset,
 			},
 		}
 
@@ -971,7 +971,7 @@ func (r *ParseableConfigReconciler) buildMetricsEventsCollectorConfig(
 			"headers": map[string]interface{}{
 				"Authorization":  fmt.Sprintf("Basic %s", basicAuth),
 				"X-P-Log-Source": "otel-logs",
-				"X-P-Stream":     events.Stream,
+				"X-P-Stream":     events.TargetDataset,
 			},
 		}
 

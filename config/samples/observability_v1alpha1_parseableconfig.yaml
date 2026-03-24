@@ -13,7 +13,7 @@ spec:
       namespace: parseable-operator-system
 
   traces:
-    stream: pai-traces-ds
+    targetDataset: pai-traces-ds
     namespaceSelector:
       mode: include
       namespaces:
@@ -27,7 +27,7 @@ spec:
       detectionTimeout: "1m"
 
   logs:
-    stream: pai-logs
+    targetDataset: pai-logs
     namespaceSelector:
       mode: include
       namespaces:
@@ -35,17 +35,17 @@ spec:
 
   metrics:
     podMetrics:
-      stream: pai-pod-metrics
+      targetDataset: pai-pod-metrics
       namespaceSelector:
         mode: include
         namespaces:
           - demo
     nodeMetrics:
-      stream: pai-node-metrics
+      targetDataset: pai-node-metrics
 
   events:
     enabled: true
-    stream: pai-events
+    targetDataset: pai-events
     namespaceSelector:
       mode: include
       namespaces:

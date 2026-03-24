@@ -62,8 +62,9 @@ spec:
                           type: string
                         type: array
                     type: object
-                  stream:
-                    description: Stream is the Parseable stream name for event data
+                  targetDataset:
+                    description: TargetDataset is the Parseable dataset name for event
+                      data
                     type: string
                 required:
                 - enabled
@@ -88,11 +89,12 @@ spec:
                           type: string
                         type: array
                     type: object
-                  stream:
-                    description: Stream is the Parseable stream name for log data
+                  targetDataset:
+                    description: TargetDataset is the Parseable dataset name for log
+                      data
                     type: string
                 required:
-                - stream
+                - targetDataset
                 type: object
               metrics:
                 description: Metrics defines metrics configuration
@@ -118,12 +120,12 @@ spec:
                               type: string
                             type: array
                         type: object
-                      stream:
-                        description: Stream is the Parseable stream name for node
-                          metric data
+                      targetDataset:
+                        description: TargetDataset is the Parseable dataset name for
+                          node metric data
                         type: string
                     required:
-                    - stream
+                    - targetDataset
                     type: object
                   podMetrics:
                     description: PodMetrics controls collection of pod/container-level
@@ -146,12 +148,12 @@ spec:
                               type: string
                             type: array
                         type: object
-                      stream:
-                        description: Stream is the Parseable stream name for pod/container
-                          metric data
+                      targetDataset:
+                        description: TargetDataset is the Parseable dataset name for
+                          pod/container metric data
                         type: string
                     required:
-                    - stream
+                    - targetDataset
                     type: object
                 type: object
               target:
@@ -214,8 +216,9 @@ spec:
                           type: string
                         type: array
                     type: object
-                  stream:
-                    description: Stream is the Parseable stream name for trace data
+                  targetDataset:
+                    description: TargetDataset is the Parseable dataset name for trace
+                      data
                     type: string
                   workloadSelector:
                     description: WorkloadSelector defines which workloads to include
@@ -272,7 +275,7 @@ spec:
                     type: object
                     x-kubernetes-map-type: atomic
                 required:
-                - stream
+                - targetDataset
                 type: object
             required:
             - target

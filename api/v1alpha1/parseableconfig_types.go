@@ -71,8 +71,8 @@ type WorkloadSelector struct {
 
 // TracesConfig defines tracing configuration
 type TracesConfig struct {
-	// Stream is the Parseable stream name for trace data
-	Stream string `json:"stream"`
+	// TargetDataset is the Parseable dataset name for trace data
+	TargetDataset string `json:"targetDataset"`
 
 	// NamespaceSelector defines which namespaces to target for tracing
 	NamespaceSelector NamespaceSelector `json:"namespaceSelector,omitempty"`
@@ -86,8 +86,8 @@ type TracesConfig struct {
 
 // LogsConfig defines logging configuration
 type LogsConfig struct {
-	// Stream is the Parseable stream name for log data
-	Stream string `json:"stream"`
+	// TargetDataset is the Parseable dataset name for log data
+	TargetDataset string `json:"targetDataset"`
 
 	// NamespaceSelector defines which namespaces to collect logs from
 	NamespaceSelector NamespaceSelector `json:"namespaceSelector,omitempty"`
@@ -95,8 +95,8 @@ type LogsConfig struct {
 
 // PodMetricsConfig defines pod/container-level metrics collection settings
 type PodMetricsConfig struct {
-	// Stream is the Parseable stream name for pod/container metric data
-	Stream string `json:"stream"`
+	// TargetDataset is the Parseable dataset name for pod/container metric data
+	TargetDataset string `json:"targetDataset"`
 
 	// NamespaceSelector defines which namespaces to collect pod metrics from
 	NamespaceSelector NamespaceSelector `json:"namespaceSelector,omitempty"`
@@ -104,8 +104,8 @@ type PodMetricsConfig struct {
 
 // NodeMetricsConfig defines node-level metrics collection settings
 type NodeMetricsConfig struct {
-	// Stream is the Parseable stream name for node metric data
-	Stream string `json:"stream"`
+	// TargetDataset is the Parseable dataset name for node metric data
+	TargetDataset string `json:"targetDataset"`
 
 	// NamespaceSelector defines which namespaces to collect node metrics from
 	NamespaceSelector NamespaceSelector `json:"namespaceSelector,omitempty"`
@@ -125,8 +125,8 @@ type EventsConfig struct {
 	// Enabled controls whether Kubernetes events are collected
 	Enabled bool `json:"enabled"`
 
-	// Stream is the Parseable stream name for event data
-	Stream string `json:"stream,omitempty"`
+	// TargetDataset is the Parseable dataset name for event data
+	TargetDataset string `json:"targetDataset,omitempty"`
 
 	// NamespaceSelector defines which namespaces to collect events from
 	NamespaceSelector NamespaceSelector `json:"namespaceSelector,omitempty"`
