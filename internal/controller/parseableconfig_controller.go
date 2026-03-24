@@ -308,17 +308,17 @@ func (r *ParseableConfigReconciler) ensureCollectorRBAC(ctx context.Context) err
 			{
 				APIGroups: []string{"apps"},
 				Resources: []string{"daemonsets", "deployments", "replicasets", "statefulsets"},
-				Verbs: []string{"get", "list", "watch"},
+				Verbs:     []string{"get", "list", "watch"},
 			},
 			{
 				APIGroups: []string{"batch"},
 				Resources: []string{"jobs", "cronjobs"},
-				Verbs: []string{"get", "list", "watch"},
+				Verbs:     []string{"get", "list", "watch"},
 			},
 			{
 				APIGroups: []string{"autoscaling"},
 				Resources: []string{"horizontalpodautoscalers"},
-				Verbs: []string{"get", "list", "watch"},
+				Verbs:     []string{"get", "list", "watch"},
 			},
 		},
 	}
@@ -647,7 +647,7 @@ func (r *ParseableConfigReconciler) buildLogCollectorConfig(ctx context.Context,
 			"headers": map[string]interface{}{
 				"Authorization":  fmt.Sprintf("Basic %s", basicAuth),
 				"X-P-Log-Source": "otel-logs",
-				"X-P-Stream":    logs.Stream,
+				"X-P-Stream":     logs.Stream,
 			},
 		},
 	}
@@ -682,7 +682,7 @@ func (r *ParseableConfigReconciler) buildLogCollectorConfig(ctx context.Context,
 				"headers": map[string]interface{}{
 					"Authorization":  fmt.Sprintf("Basic %s", basicAuth),
 					"X-P-Log-Source": "otel-metrics",
-					"X-P-Stream":    config.Spec.Metrics.NodeMetrics.Stream,
+					"X-P-Stream":     config.Spec.Metrics.NodeMetrics.Stream,
 				},
 			}
 			// filter/node_only — keep only k8s.node.* metrics
@@ -709,7 +709,7 @@ func (r *ParseableConfigReconciler) buildLogCollectorConfig(ctx context.Context,
 				"headers": map[string]interface{}{
 					"Authorization":  fmt.Sprintf("Basic %s", basicAuth),
 					"X-P-Log-Source": "otel-metrics",
-					"X-P-Stream":    config.Spec.Metrics.PodMetrics.Stream,
+					"X-P-Stream":     config.Spec.Metrics.PodMetrics.Stream,
 				},
 			}
 			// filter/pod_only — drop k8s.node.* metrics, keep pod/container metrics
@@ -725,20 +725,37 @@ func (r *ParseableConfigReconciler) buildLogCollectorConfig(ctx context.Context,
 
 			// filter/pod_ns — filter pod metrics to configured namespaces
 			podNs := config.Spec.Metrics.PodMetrics.NamespaceSelector
-			if len(podNs.Namespaces) > 0 && podNs.Mode == "include" {
-				parts := make([]string, 0, len(podNs.Namespaces))
-				for _, ns := range podNs.Namespaces {
-					parts = append(parts, fmt.Sprintf(`resource.attributes["k8s.namespace.name"] != "%s"`, ns))
-				}
-				processors["filter/pod_ns"] = map[string]interface{}{
-					"error_mode": "ignore",
-					"metrics": map[string]interface{}{
-						"metric": []interface{}{
-							strings.Join(parts, " and "),
+			if len(podNs.Namespaces) > 0 {
+				switch podNs.Mode {
+				case "include":
+					// Drop metrics NOT in the allowed namespaces
+					parts := make([]string, 0, len(podNs.Namespaces))
+					for _, ns := range podNs.Namespaces {
+						parts = append(parts, fmt.Sprintf(`resource.attributes["k8s.namespace.name"] != "%s"`, ns))
+					}
+					processors["filter/pod_ns"] = map[string]interface{}{
+						"error_mode": "ignore",
+						"metrics": map[string]interface{}{
+							"metric": []interface{}{
+								strings.Join(parts, " and "),
+							},
 						},
-					},
+					}
+					podProcessors = append(podProcessors, "filter/pod_ns")
+				case "exclude":
+					// Drop metrics IN the excluded namespaces
+					var conditions []interface{}
+					for _, ns := range podNs.Namespaces {
+						conditions = append(conditions, fmt.Sprintf(`resource.attributes["k8s.namespace.name"] == "%s"`, ns))
+					}
+					processors["filter/pod_ns"] = map[string]interface{}{
+						"error_mode": "ignore",
+						"metrics": map[string]interface{}{
+							"metric": conditions,
+						},
+					}
+					podProcessors = append(podProcessors, "filter/pod_ns")
 				}
-				podProcessors = append(podProcessors, "filter/pod_ns")
 			}
 
 			podProcessors = append(podProcessors, "batch")
@@ -872,7 +889,7 @@ func (r *ParseableConfigReconciler) buildMetricsEventsCollectorConfig(
 		k8sClusterCfg := map[string]interface{}{
 			"collection_interval": "30s",
 		}
-		// Use the receiver's native namespaces field to filter at source
+		// Use the receiver's native namespaces field to filter at source (include mode only)
 		if len(podMetrics.NamespaceSelector.Namespaces) > 0 && podMetrics.NamespaceSelector.Mode == "include" {
 			k8sClusterCfg["namespaces"] = toInterfaceSlice(podMetrics.NamespaceSelector.Namespaces)
 		}
@@ -903,7 +920,7 @@ func (r *ParseableConfigReconciler) buildMetricsEventsCollectorConfig(
 			"headers": map[string]interface{}{
 				"Authorization":  fmt.Sprintf("Basic %s", basicAuth),
 				"X-P-Log-Source": "otel-metrics",
-				"X-P-Stream":    podMetrics.Stream,
+				"X-P-Stream":     podMetrics.Stream,
 			},
 		}
 
@@ -954,7 +971,7 @@ func (r *ParseableConfigReconciler) buildMetricsEventsCollectorConfig(
 			"headers": map[string]interface{}{
 				"Authorization":  fmt.Sprintf("Basic %s", basicAuth),
 				"X-P-Log-Source": "otel-logs",
-				"X-P-Stream":    events.Stream,
+				"X-P-Stream":     events.Stream,
 			},
 		}
 
