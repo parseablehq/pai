@@ -46,6 +46,12 @@ type TargetConfig struct {
 
 	// CredentialsSecret references the secret containing authentication credentials
 	CredentialsSecret SecretReference `json:"credentialsSecret"`
+
+	// GlobalTenantID is an optional tenant identifier. When set, the X-P-Tenant header is added to all collector exporters.
+	GlobalTenantID string `json:"globalTenantId,omitempty"`
+
+	// Headers are additional HTTP headers applied to all signal exporters. Signal-level headers override these.
+	Headers map[string]string `json:"headers,omitempty"`
 }
 
 // InstrumentationConfig defines auto-instrumentation settings
@@ -74,6 +80,9 @@ type TracesConfig struct {
 	// TargetDataset is the Parseable dataset name for trace data
 	TargetDataset string `json:"targetDataset"`
 
+	// Headers are additional HTTP headers for the traces exporter. Overrides global headers with the same key.
+	Headers map[string]string `json:"headers,omitempty"`
+
 	// NamespaceSelector defines which namespaces to target for tracing
 	NamespaceSelector NamespaceSelector `json:"namespaceSelector,omitempty"`
 
@@ -89,6 +98,9 @@ type LogsConfig struct {
 	// TargetDataset is the Parseable dataset name for log data
 	TargetDataset string `json:"targetDataset"`
 
+	// Headers are additional HTTP headers for the logs exporter. Overrides global headers with the same key.
+	Headers map[string]string `json:"headers,omitempty"`
+
 	// NamespaceSelector defines which namespaces to collect logs from
 	NamespaceSelector NamespaceSelector `json:"namespaceSelector,omitempty"`
 }
@@ -98,6 +110,9 @@ type PodMetricsConfig struct {
 	// TargetDataset is the Parseable dataset name for pod/container metric data
 	TargetDataset string `json:"targetDataset"`
 
+	// Headers are additional HTTP headers for the pod metrics exporter. Overrides global headers with the same key.
+	Headers map[string]string `json:"headers,omitempty"`
+
 	// NamespaceSelector defines which namespaces to collect pod metrics from
 	NamespaceSelector NamespaceSelector `json:"namespaceSelector,omitempty"`
 }
@@ -106,6 +121,9 @@ type PodMetricsConfig struct {
 type NodeMetricsConfig struct {
 	// TargetDataset is the Parseable dataset name for node metric data
 	TargetDataset string `json:"targetDataset"`
+
+	// Headers are additional HTTP headers for the node metrics exporter. Overrides global headers with the same key.
+	Headers map[string]string `json:"headers,omitempty"`
 
 	// NamespaceSelector defines which namespaces to collect node metrics from
 	NamespaceSelector NamespaceSelector `json:"namespaceSelector,omitempty"`
@@ -128,12 +146,19 @@ type EventsConfig struct {
 	// TargetDataset is the Parseable dataset name for event data
 	TargetDataset string `json:"targetDataset,omitempty"`
 
+	// Headers are additional HTTP headers for the events exporter. Overrides global headers with the same key.
+	Headers map[string]string `json:"headers,omitempty"`
+
 	// NamespaceSelector defines which namespaces to collect events from
 	NamespaceSelector NamespaceSelector `json:"namespaceSelector,omitempty"`
 }
 
 // ParseableConfigSpec defines the desired state of ParseableConfig
 type ParseableConfigSpec struct {
+	// Paused stops all data collection when set to true.
+	// Collectors, instrumentation, and agent are deleted. Set to false to resume.
+	Paused bool `json:"paused,omitempty"`
+
 	// Target defines the global Parseable endpoint and credentials
 	Target TargetConfig `json:"target"`
 

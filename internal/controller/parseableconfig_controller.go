@@ -44,16 +44,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	observabilityv1alpha1 "github.com/parseable/pai/api/v1alpha1"
-	"github.com/parseable/pai/internal/helm"
 )
 
 const (
-	otelOperatorNamespace = "otel-operator"
-	otelOperatorRelease   = "opentelemetry-operator"
-	otelOperatorRepoName  = "open-telemetry"
-	otelOperatorRepoURL   = "https://open-telemetry.github.io/opentelemetry-helm-charts"
-	otelOperatorChartRef  = "open-telemetry/opentelemetry-operator"
-	instrumentationName   = "pai-instrumentation"
+	instrumentationName = "pai-instrumentation"
 
 	// kept for cleanup of legacy sidecar resources
 	sidecarCollectorName = "pai-sidecar"
@@ -65,7 +59,6 @@ const (
 	paiAgentDaemonSetName      = "pai-agent"
 
 	instrumentationAnnotPrefix = "instrumentation.opentelemetry.io/inject-"
-	instrumentationRefValue    = otelOperatorNamespace + "/" + instrumentationName
 
 	finalizerName = "observability.parseable.com/finalizer"
 )
@@ -160,15 +153,32 @@ func (r *ParseableConfigReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		logger.Info("Finalizer added", "name", config.Name)
 	}
 
-	logger.Info("Reconciling Pai config", "name", config.Name)
-
-	// Step 1: Ensure OpenTelemetry operator is installed
-	if err := r.ensureOtelOperator(ctx); err != nil {
-		logger.Error(err, "Failed to ensure OpenTelemetry operator")
-		return ctrl.Result{}, err
+	// Handle paused state — delete all collectors and stop reconciliation
+	if config.Spec.Paused {
+		logger.Info("ParseableConfig is paused, removing all collectors and instrumentation")
+		if err := r.cleanup(ctx, config); err != nil {
+			logger.Error(err, "Failed to cleanup resources for pause")
+		}
+		return ctrl.Result{}, nil
 	}
 
-	// Step 2: Ensure Instrumentation CR exists (sends traces directly to Parseable)
+	logger.Info("Reconciling Pai config", "name", config.Name)
+
+	// Step 0: Ensure namespace exists
+	ns := &corev1.Namespace{}
+	if err := r.Get(ctx, client.ObjectKey{Name: config.Namespace}, ns); err != nil {
+		if errors.IsNotFound(err) {
+			ns = &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: config.Namespace}}
+			if err := r.Create(ctx, ns); err != nil && !errors.IsAlreadyExists(err) {
+				return ctrl.Result{}, fmt.Errorf("failed to create namespace %s: %w", config.Namespace, err)
+			}
+			logger.Info("Namespace created", "namespace", config.Namespace)
+		} else {
+			return ctrl.Result{}, err
+		}
+	}
+
+	// Step 1: Ensure Instrumentation CR exists (sends traces directly to Parseable)
 	if err := r.ensureInstrumentation(ctx, config); err != nil {
 		logger.Error(err, "Failed to ensure Instrumentation CR")
 		return ctrl.Result{}, err
@@ -187,7 +197,7 @@ func (r *ParseableConfigReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	}
 
 	// Step 5: Ensure collector RBAC (ClusterRole + bindings for collector ServiceAccounts)
-	if err := r.ensureCollectorRBAC(ctx); err != nil {
+	if err := r.ensureCollectorRBAC(ctx, config.Namespace); err != nil {
 		logger.Error(err, "Failed to ensure collector RBAC")
 		return ctrl.Result{}, err
 	}
@@ -207,95 +217,16 @@ func (r *ParseableConfigReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 }
 
-// ensureOtelOperator checks if the otel operator is installed, installs it if not
-func (r *ParseableConfigReconciler) ensureOtelOperator(ctx context.Context) error {
-	logger := log.FromContext(ctx)
-
-	helmClient, err := helm.NewClient(otelOperatorNamespace, r.RestConfig)
-	if err != nil {
-		return fmt.Errorf("failed to create helm client: %w", err)
-	}
-
-	// Check if release already exists
-	exists, err := helmClient.ReleaseExists(otelOperatorRelease)
-	if err != nil {
-		return fmt.Errorf("failed to check otel operator release: %w", err)
-	}
-
-	if exists {
-		logger.Info("OpenTelemetry operator already installed, skipping")
-		return nil
-	}
-
-	logger.Info("OpenTelemetry operator not found, installing")
-
-	// Add the helm repo
-	logger.Info("Adding Helm repository", "name", otelOperatorRepoName, "url", otelOperatorRepoURL)
-	if err := helmClient.AddRepository(otelOperatorRepoName, otelOperatorRepoURL); err != nil {
-		return fmt.Errorf("failed to add otel helm repo: %w", err)
-	}
-	logger.Info("Helm repository added successfully", "name", otelOperatorRepoName)
-
-	// Install with required values
-	values := map[string]interface{}{
-		"manager": map[string]interface{}{
-			"collectorImage": map[string]interface{}{
-				"repository": "otel/opentelemetry-collector-k8s",
-			},
-		},
-		"admissionWebhooks": map[string]interface{}{
-			"certManager": map[string]interface{}{
-				"enabled": false,
-			},
-			"autoGenerateCert": map[string]interface{}{
-				"enabled": true,
-			},
-		},
-	}
-
-	logger.Info("Installing Helm chart", "release", otelOperatorRelease, "chart", otelOperatorChartRef, "namespace", otelOperatorNamespace)
-	if err := helmClient.InstallChart(ctx, otelOperatorRelease, otelOperatorChartRef, otelOperatorNamespace, values); err != nil {
-		return fmt.Errorf("failed to install otel operator: %w", err)
-	}
-
-	logger.Info("OpenTelemetry operator installed successfully, waiting for webhook readiness", "release", otelOperatorRelease, "namespace", otelOperatorNamespace)
-
-	// Wait for the OTel operator deployment to be ready (webhook must be serving before we annotate workloads)
-	timeout := time.After(3 * time.Minute)
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-timeout:
-			return fmt.Errorf("timed out waiting for otel operator to be ready")
-		case <-ticker.C:
-			deploy := &appsv1.Deployment{}
-			if err := r.Get(ctx, client.ObjectKey{Name: "opentelemetry-operator", Namespace: otelOperatorNamespace}, deploy); err != nil {
-				logger.Info("Waiting for otel operator deployment...", "error", err.Error())
-				continue
-			}
-			if deploy.Status.ReadyReplicas > 0 && deploy.Status.ReadyReplicas == deploy.Status.Replicas {
-				logger.Info("OpenTelemetry operator is ready")
-				// Give webhook a few more seconds to register
-				time.Sleep(10 * time.Second)
-				return nil
-			}
-			logger.Info("Waiting for otel operator to be ready", "readyReplicas", deploy.Status.ReadyReplicas, "replicas", deploy.Status.Replicas)
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-}
-
 // ensureCollectorRBAC creates a ClusterRole and ClusterRoleBindings for collector ServiceAccounts.
 // The k8s_cluster, k8sobjects, and kubeletstats receivers need permissions to list/watch cluster resources.
-func (r *ParseableConfigReconciler) ensureCollectorRBAC(ctx context.Context) error {
+func (r *ParseableConfigReconciler) ensureCollectorRBAC(ctx context.Context, namespace string) error {
 	logger := log.FromContext(ctx)
 
-	// Create or update ClusterRole
+	// Create or update ClusterRole (namespaced name to avoid conflicts)
+	clusterRoleName := namespace + "-" + collectorClusterRoleName
 	role := &rbacv1.ClusterRole{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: collectorClusterRoleName,
+			Name: clusterRoleName,
 		},
 		Rules: []rbacv1.PolicyRule{
 			{
@@ -329,7 +260,7 @@ func (r *ParseableConfigReconciler) ensureCollectorRBAC(ctx context.Context) err
 			if err := r.Create(ctx, role); err != nil {
 				return fmt.Errorf("failed to create ClusterRole: %w", err)
 			}
-			logger.Info("ClusterRole created", "name", collectorClusterRoleName)
+			logger.Info("ClusterRole created", "name", clusterRoleName)
 		} else {
 			return err
 		}
@@ -349,18 +280,18 @@ func (r *ParseableConfigReconciler) ensureCollectorRBAC(ctx context.Context) err
 	for _, sa := range serviceAccounts {
 		binding := &rbacv1.ClusterRoleBinding{
 			ObjectMeta: metav1.ObjectMeta{
-				Name: "pai-" + sa,
+				Name: namespace + "-" + sa,
 			},
 			RoleRef: rbacv1.RoleRef{
 				APIGroup: "rbac.authorization.k8s.io",
 				Kind:     "ClusterRole",
-				Name:     collectorClusterRoleName,
+				Name:     clusterRoleName,
 			},
 			Subjects: []rbacv1.Subject{
 				{
 					Kind:      "ServiceAccount",
 					Name:      sa,
-					Namespace: otelOperatorNamespace,
+					Namespace: namespace,
 				},
 			},
 		}
@@ -374,6 +305,11 @@ func (r *ParseableConfigReconciler) ensureCollectorRBAC(ctx context.Context) err
 				logger.Info("ClusterRoleBinding created", "serviceAccount", sa)
 			} else {
 				return err
+			}
+		} else {
+			existingBinding.Subjects = binding.Subjects
+			if err := r.Update(ctx, existingBinding); err != nil {
+				return fmt.Errorf("failed to update ClusterRoleBinding for %s: %w", sa, err)
 			}
 		}
 	}
@@ -412,7 +348,7 @@ func (r *ParseableConfigReconciler) buildInstrumentationSpec(ctx context.Context
 			},
 			map[string]interface{}{
 				"name":  "OTEL_EXPORTER_OTLP_HEADERS",
-				"value": fmt.Sprintf("Authorization=Basic %s,X-P-Log-Source=otel-traces,X-P-Stream=%s", basicAuth, tracesStream),
+				"value": r.buildOtlpHeaders(basicAuth, "otel-traces", tracesStream, config.Spec.Target.GlobalTenantID, config.Spec.Target.Headers, config.Spec.Traces.Headers),
 			},
 		},
 	}
@@ -446,7 +382,7 @@ func (r *ParseableConfigReconciler) ensureInstrumentation(ctx context.Context, c
 		Kind:    "Instrumentation",
 	})
 
-	err := r.Get(ctx, client.ObjectKey{Name: instrumentationName, Namespace: otelOperatorNamespace}, existing)
+	err := r.Get(ctx, client.ObjectKey{Name: instrumentationName, Namespace: config.Namespace}, existing)
 	if err != nil && !errors.IsNotFound(err) {
 		return fmt.Errorf("failed to check Instrumentation CR: %w", err)
 	}
@@ -474,7 +410,7 @@ func (r *ParseableConfigReconciler) ensureInstrumentation(ctx context.Context, c
 			"kind":       "Instrumentation",
 			"metadata": map[string]interface{}{
 				"name":      instrumentationName,
-				"namespace": otelOperatorNamespace,
+				"namespace": config.Namespace,
 			},
 			"spec": spec,
 		},
@@ -484,7 +420,7 @@ func (r *ParseableConfigReconciler) ensureInstrumentation(ctx context.Context, c
 		return fmt.Errorf("failed to create Instrumentation CR: %w", err)
 	}
 
-	logger.Info("Instrumentation CR created successfully", "name", instrumentationName, "namespace", otelOperatorNamespace)
+	logger.Info("Instrumentation CR created successfully", "name", instrumentationName, "namespace", config.Namespace)
 	return nil
 }
 
@@ -501,7 +437,7 @@ func (r *ParseableConfigReconciler) ensureLogCollector(ctx context.Context, conf
 
 	existing := &unstructured.Unstructured{}
 	existing.SetGroupVersionKind(gvk)
-	err := r.Get(ctx, client.ObjectKey{Name: logCollectorName, Namespace: otelOperatorNamespace}, existing)
+	err := r.Get(ctx, client.ObjectKey{Name: logCollectorName, Namespace: config.Namespace}, existing)
 
 	// If logs not configured, clean up any existing collector and return
 	if config.Spec.Logs == nil || config.Spec.Logs.TargetDataset == "" {
@@ -561,7 +497,7 @@ func (r *ParseableConfigReconciler) ensureLogCollector(ctx context.Context, conf
 			"kind":       "OpenTelemetryCollector",
 			"metadata": map[string]interface{}{
 				"name":      logCollectorName,
-				"namespace": otelOperatorNamespace,
+				"namespace": config.Namespace,
 			},
 			"spec": spec,
 		},
@@ -641,14 +577,11 @@ func (r *ParseableConfigReconciler) buildLogCollectorConfig(ctx context.Context,
 			},
 		},
 	}
+	tenantID := config.Spec.Target.GlobalTenantID
 	exporters := map[string]interface{}{
 		"otlphttp/logs": map[string]interface{}{
 			"endpoint": endpoint,
-			"headers": map[string]interface{}{
-				"Authorization":  fmt.Sprintf("Basic %s", basicAuth),
-				"X-P-Log-Source": "otel-logs",
-				"X-P-Stream":     logs.TargetDataset,
-			},
+			"headers":  r.buildExporterHeaders(basicAuth, "otel-logs", logs.TargetDataset, tenantID, config.Spec.Target.Headers, logs.Headers),
 		},
 	}
 	pipelines := map[string]interface{}{
@@ -679,11 +612,7 @@ func (r *ParseableConfigReconciler) buildLogCollectorConfig(ctx context.Context,
 			addKubeletstats()
 			exporters["otlphttp/nodemetrics"] = map[string]interface{}{
 				"endpoint": endpoint,
-				"headers": map[string]interface{}{
-					"Authorization":  fmt.Sprintf("Basic %s", basicAuth),
-					"X-P-Log-Source": "otel-metrics",
-					"X-P-Stream":     config.Spec.Metrics.NodeMetrics.TargetDataset,
-				},
+				"headers":  r.buildExporterHeaders(basicAuth, "otel-metrics", config.Spec.Metrics.NodeMetrics.TargetDataset, tenantID, config.Spec.Target.Headers, config.Spec.Metrics.NodeMetrics.Headers),
 			}
 			// filter/node_only — keep only k8s.node.* metrics
 			processors["filter/node_only"] = map[string]interface{}{
@@ -706,11 +635,7 @@ func (r *ParseableConfigReconciler) buildLogCollectorConfig(ctx context.Context,
 			addKubeletstats()
 			exporters["otlphttp/podmetrics"] = map[string]interface{}{
 				"endpoint": endpoint,
-				"headers": map[string]interface{}{
-					"Authorization":  fmt.Sprintf("Basic %s", basicAuth),
-					"X-P-Log-Source": "otel-metrics",
-					"X-P-Stream":     config.Spec.Metrics.PodMetrics.TargetDataset,
-				},
+				"headers":  r.buildExporterHeaders(basicAuth, "otel-metrics", config.Spec.Metrics.PodMetrics.TargetDataset, tenantID, config.Spec.Target.Headers, config.Spec.Metrics.PodMetrics.Headers),
 			}
 			// filter/pod_only — drop k8s.node.* metrics, keep pod/container metrics
 			processors["filter/pod_only"] = map[string]interface{}{
@@ -793,7 +718,7 @@ func (r *ParseableConfigReconciler) ensureMetricsEventsCollector(ctx context.Con
 
 	existing := &unstructured.Unstructured{}
 	existing.SetGroupVersionKind(gvk)
-	err := r.Get(ctx, client.ObjectKey{Name: metricsEventsCollectorName, Namespace: otelOperatorNamespace}, existing)
+	err := r.Get(ctx, client.ObjectKey{Name: metricsEventsCollectorName, Namespace: config.Namespace}, existing)
 
 	metricsEnabled := config.Spec.Metrics != nil && config.Spec.Metrics.PodMetrics != nil && config.Spec.Metrics.PodMetrics.TargetDataset != ""
 	eventsEnabled := config.Spec.Events != nil && config.Spec.Events.Enabled && config.Spec.Events.TargetDataset != ""
@@ -838,7 +763,7 @@ func (r *ParseableConfigReconciler) ensureMetricsEventsCollector(ctx context.Con
 			"kind":       "OpenTelemetryCollector",
 			"metadata": map[string]interface{}{
 				"name":      metricsEventsCollectorName,
-				"namespace": otelOperatorNamespace,
+				"namespace": config.Namespace,
 			},
 			"spec": spec,
 		},
@@ -874,6 +799,7 @@ func (r *ParseableConfigReconciler) buildMetricsEventsCollectorConfig(
 	password := string(secret.Data["password"])
 	basicAuth := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", username, password)))
 	endpoint := strings.TrimRight(config.Spec.Target.Endpoint, "/")
+	tenantID := config.Spec.Target.GlobalTenantID
 
 	receivers := map[string]interface{}{}
 	processors := map[string]interface{}{
@@ -917,11 +843,7 @@ func (r *ParseableConfigReconciler) buildMetricsEventsCollectorConfig(
 
 		exporters["otlphttp/metrics"] = map[string]interface{}{
 			"endpoint": endpoint,
-			"headers": map[string]interface{}{
-				"Authorization":  fmt.Sprintf("Basic %s", basicAuth),
-				"X-P-Log-Source": "otel-metrics",
-				"X-P-Stream":     podMetrics.TargetDataset,
-			},
+			"headers":  r.buildExporterHeaders(basicAuth, "otel-metrics", podMetrics.TargetDataset, tenantID, config.Spec.Target.Headers, podMetrics.Headers),
 		}
 
 		pipelines["metrics"] = map[string]interface{}{
@@ -968,11 +890,7 @@ func (r *ParseableConfigReconciler) buildMetricsEventsCollectorConfig(
 
 		exporters["otlphttp/events"] = map[string]interface{}{
 			"endpoint": endpoint,
-			"headers": map[string]interface{}{
-				"Authorization":  fmt.Sprintf("Basic %s", basicAuth),
-				"X-P-Log-Source": "otel-logs",
-				"X-P-Stream":     events.TargetDataset,
-			},
+			"headers":  r.buildExporterHeaders(basicAuth, "otel-logs", events.TargetDataset, tenantID, config.Spec.Target.Headers, events.Headers),
 		}
 
 		pipelines["logs"] = map[string]interface{}{
@@ -1001,6 +919,53 @@ func toInterfaceSlice(ss []string) []interface{} {
 		out[i] = s
 	}
 	return out
+}
+
+// buildExporterHeaders returns a merged headers map for collector exporters.
+// Merge order: globalHeaders → signalHeaders → built-in headers (Authorization, X-P-Stream, X-P-Log-Source, X-P-Tenant).
+// Built-in headers always win.
+func (r *ParseableConfigReconciler) buildExporterHeaders(basicAuth, logSource, dataset, tenantID string, globalHeaders, signalHeaders map[string]string) map[string]interface{} {
+	headers := map[string]interface{}{}
+	// 1. Global headers
+	for k, v := range globalHeaders {
+		headers[k] = v
+	}
+	// 2. Signal-level headers (override global)
+	for k, v := range signalHeaders {
+		headers[k] = v
+	}
+	// 3. Built-in headers (always win)
+	headers["Authorization"] = fmt.Sprintf("Basic %s", basicAuth)
+	headers["X-P-Log-Source"] = logSource
+	headers["X-P-Stream"] = dataset
+	if tenantID != "" {
+		headers["X-P-Tenant"] = tenantID
+	}
+	return headers
+}
+
+// buildOtlpHeaders returns a comma-delimited OTEL_EXPORTER_OTLP_HEADERS value for instrumentation env vars.
+// Merge order: globalHeaders → signalHeaders → built-in headers.
+func (r *ParseableConfigReconciler) buildOtlpHeaders(basicAuth, logSource, dataset, tenantID string, globalHeaders, signalHeaders map[string]string) string {
+	merged := map[string]string{}
+	for k, v := range globalHeaders {
+		merged[k] = v
+	}
+	for k, v := range signalHeaders {
+		merged[k] = v
+	}
+	// Built-in headers always win
+	merged["Authorization"] = fmt.Sprintf("Basic %s", basicAuth)
+	merged["X-P-Log-Source"] = logSource
+	merged["X-P-Stream"] = dataset
+	if tenantID != "" {
+		merged["X-P-Tenant"] = tenantID
+	}
+	var parts []string
+	for k, v := range merged {
+		parts = append(parts, fmt.Sprintf("%s=%s", k, v))
+	}
+	return strings.Join(parts, ",")
 }
 
 // workloadKey returns a unique key for a workload (kind/namespace/name)
@@ -1238,7 +1203,7 @@ func (r *ParseableConfigReconciler) cleanup(ctx context.Context, config *observa
 	}
 
 	// Step 2: Delete Instrumentation CR
-	logger.Info("Deleting Instrumentation CR", "name", instrumentationName, "namespace", otelOperatorNamespace)
+	logger.Info("Deleting Instrumentation CR", "name", instrumentationName, "namespace", config.Namespace)
 	instrumentation := &unstructured.Unstructured{}
 	instrumentation.SetGroupVersionKind(schema.GroupVersionKind{
 		Group:   "opentelemetry.io",
@@ -1246,7 +1211,7 @@ func (r *ParseableConfigReconciler) cleanup(ctx context.Context, config *observa
 		Kind:    "Instrumentation",
 	})
 	instrumentation.SetName(instrumentationName)
-	instrumentation.SetNamespace(otelOperatorNamespace)
+	instrumentation.SetNamespace(config.Namespace)
 	if err := r.Delete(ctx, instrumentation); err != nil {
 		if !errors.IsNotFound(err) {
 			logger.Error(err, "Failed to delete Instrumentation CR")
@@ -1256,7 +1221,7 @@ func (r *ParseableConfigReconciler) cleanup(ctx context.Context, config *observa
 	}
 
 	// Step 3: Delete Log Collector CR
-	logger.Info("Deleting Log Collector CR", "name", logCollectorName, "namespace", otelOperatorNamespace)
+	logger.Info("Deleting Log Collector CR", "name", logCollectorName, "namespace", config.Namespace)
 	logCollector := &unstructured.Unstructured{}
 	logCollector.SetGroupVersionKind(schema.GroupVersionKind{
 		Group:   "opentelemetry.io",
@@ -1264,7 +1229,7 @@ func (r *ParseableConfigReconciler) cleanup(ctx context.Context, config *observa
 		Kind:    "OpenTelemetryCollector",
 	})
 	logCollector.SetName(logCollectorName)
-	logCollector.SetNamespace(otelOperatorNamespace)
+	logCollector.SetNamespace(config.Namespace)
 	if err := r.Delete(ctx, logCollector); err != nil {
 		if !errors.IsNotFound(err) {
 			logger.Error(err, "Failed to delete Log Collector CR")
@@ -1274,12 +1239,12 @@ func (r *ParseableConfigReconciler) cleanup(ctx context.Context, config *observa
 	}
 
 	// Step 4: Delete Metrics/Events Collector CR
-	r.deleteCollectorCR(ctx, metricsEventsCollectorName)
+	r.deleteCollectorCR(ctx, metricsEventsCollectorName, config.Namespace)
 
 	// Step 5: Delete PAI agent DaemonSet
 	logger.Info("Deleting PAI agent DaemonSet")
 	agentDS := &appsv1.DaemonSet{}
-	if err := r.Get(ctx, client.ObjectKey{Name: paiAgentDaemonSetName, Namespace: otelOperatorNamespace}, agentDS); err == nil {
+	if err := r.Get(ctx, client.ObjectKey{Name: paiAgentDaemonSetName, Namespace: config.Namespace}, agentDS); err == nil {
 		if err := r.Delete(ctx, agentDS); err != nil && !errors.IsNotFound(err) {
 			logger.Error(err, "Failed to delete PAI agent DaemonSet")
 		} else {
@@ -1288,7 +1253,7 @@ func (r *ParseableConfigReconciler) cleanup(ctx context.Context, config *observa
 	}
 
 	// Step 6: Delete Sidecar Collector CR (legacy)
-	logger.Info("Deleting Sidecar Collector CR", "name", sidecarCollectorName, "namespace", otelOperatorNamespace)
+	logger.Info("Deleting Sidecar Collector CR", "name", sidecarCollectorName, "namespace", config.Namespace)
 	collector := &unstructured.Unstructured{}
 	collector.SetGroupVersionKind(schema.GroupVersionKind{
 		Group:   "opentelemetry.io",
@@ -1296,7 +1261,7 @@ func (r *ParseableConfigReconciler) cleanup(ctx context.Context, config *observa
 		Kind:    "OpenTelemetryCollector",
 	})
 	collector.SetName(sidecarCollectorName)
-	collector.SetNamespace(otelOperatorNamespace)
+	collector.SetNamespace(config.Namespace)
 	if err := r.Delete(ctx, collector); err != nil {
 		if !errors.IsNotFound(err) {
 			logger.Error(err, "Failed to delete Sidecar Collector CR")
@@ -1305,35 +1270,11 @@ func (r *ParseableConfigReconciler) cleanup(ctx context.Context, config *observa
 		logger.Info("Sidecar Collector CR deleted")
 	}
 
-	// Step 4: Uninstall OTel operator Helm release
-	logger.Info("Uninstalling OpenTelemetry operator Helm release", "release", otelOperatorRelease, "namespace", otelOperatorNamespace)
-	helmClient, err := helm.NewClient(otelOperatorNamespace, r.RestConfig)
-	if err != nil {
-		logger.Error(err, "Failed to create helm client for cleanup")
-		return nil
-	}
-
-	exists, err := helmClient.ReleaseExists(otelOperatorRelease)
-	if err != nil {
-		logger.Error(err, "Failed to check helm release during cleanup")
-		return nil
-	}
-
-	if exists {
-		if err := helmClient.UninstallChart(otelOperatorRelease); err != nil {
-			logger.Error(err, "Failed to uninstall OTel operator")
-		} else {
-			logger.Info("OpenTelemetry operator Helm release uninstalled")
-		}
-	} else {
-		logger.Info("OpenTelemetry operator Helm release not found, skipping")
-	}
-
 	return nil
 }
 
 // deleteCollectorCR deletes an OpenTelemetryCollector CR by name, ignoring NotFound
-func (r *ParseableConfigReconciler) deleteCollectorCR(ctx context.Context, name string) {
+func (r *ParseableConfigReconciler) deleteCollectorCR(ctx context.Context, name, namespace string) {
 	logger := log.FromContext(ctx)
 	obj := &unstructured.Unstructured{}
 	obj.SetGroupVersionKind(schema.GroupVersionKind{
@@ -1342,7 +1283,7 @@ func (r *ParseableConfigReconciler) deleteCollectorCR(ctx context.Context, name 
 		Kind:    "OpenTelemetryCollector",
 	})
 	obj.SetName(name)
-	obj.SetNamespace(otelOperatorNamespace)
+	obj.SetNamespace(namespace)
 	if err := r.Delete(ctx, obj); err != nil {
 		if !errors.IsNotFound(err) {
 			logger.Error(err, "Failed to delete collector CR", "name", name)
@@ -1548,7 +1489,7 @@ func (r *ParseableConfigReconciler) detectLanguage(ctx context.Context, config *
 		// Phase 3: Agent-based detection — for distroless containers where exec fails
 		if lang == "" {
 			for _, pod := range pods {
-				lang = r.detectLanguageViaAgent(ctx, pod, languages)
+				lang = r.detectLanguageViaAgent(ctx, pod, languages, config.Namespace)
 				if lang != "" {
 					logger.Info("Language detected via agent (host /proc)", "name", obj.GetName(), "pod", pod.Name, "language", lang)
 					break
@@ -1574,7 +1515,7 @@ func (r *ParseableConfigReconciler) detectLanguage(ctx context.Context, config *
 		if annotations == nil {
 			annotations = make(map[string]string)
 		}
-		annotations[key] = instrumentationRefValue
+		annotations[key] = config.Namespace + "/" + instrumentationName
 		w.setPodTemplateAnnotations(annotations)
 
 		if err := r.Update(ctx, obj); err != nil {
@@ -1637,7 +1578,7 @@ func (r *ParseableConfigReconciler) ensurePaiAgent(ctx context.Context, config *
 	if config.Spec.Traces == nil || len(config.Spec.Traces.Instrumentation.Languages) == 0 {
 		// Clean up if it exists
 		existing := &appsv1.DaemonSet{}
-		if err := r.Get(ctx, client.ObjectKey{Name: paiAgentDaemonSetName, Namespace: otelOperatorNamespace}, existing); err == nil {
+		if err := r.Get(ctx, client.ObjectKey{Name: paiAgentDaemonSetName, Namespace: config.Namespace}, existing); err == nil {
 			logger.Info("No instrumentation configured, deleting PAI agent DaemonSet")
 			if err := r.Delete(ctx, existing); err != nil && !errors.IsNotFound(err) {
 				return fmt.Errorf("failed to delete PAI agent DaemonSet: %w", err)
@@ -1651,7 +1592,7 @@ func (r *ParseableConfigReconciler) ensurePaiAgent(ctx context.Context, config *
 	desired := &appsv1.DaemonSet{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      paiAgentDaemonSetName,
-			Namespace: otelOperatorNamespace,
+			Namespace: config.Namespace,
 			Labels: map[string]string{
 				"app.kubernetes.io/name":       "pai-agent",
 				"app.kubernetes.io/managed-by": "pai",
@@ -1724,7 +1665,7 @@ func (r *ParseableConfigReconciler) ensurePaiAgent(ctx context.Context, config *
 // detectLanguageViaAgent uses the PAI agent DaemonSet to read process cmdlines from the host.
 // This works for distroless containers where exec-based detection fails because there is no shell.
 // Flow: find agent pod on same node → use hostPID to read /host/proc/*/cmdline → match container PID.
-func (r *ParseableConfigReconciler) detectLanguageViaAgent(ctx context.Context, targetPod *corev1.Pod, languages []string) string {
+func (r *ParseableConfigReconciler) detectLanguageViaAgent(ctx context.Context, targetPod *corev1.Pod, languages []string, namespace string) string {
 	logger := log.FromContext(ctx)
 
 	if targetPod.Status.HostIP == "" {
@@ -1745,7 +1686,7 @@ func (r *ParseableConfigReconciler) detectLanguageViaAgent(ctx context.Context, 
 	}
 
 	// Find the PAI agent pod running on the same node
-	agentPod, err := r.findAgentPodOnNode(ctx, targetPod.Spec.NodeName)
+	agentPod, err := r.findAgentPodOnNode(ctx, targetPod.Spec.NodeName, namespace)
 	if err != nil || agentPod == nil {
 		logger.Info("No PAI agent pod found on node", "node", targetPod.Spec.NodeName)
 		return ""
@@ -1799,10 +1740,10 @@ func (r *ParseableConfigReconciler) detectLanguageViaAgent(ctx context.Context, 
 }
 
 // findAgentPodOnNode returns a running PAI agent pod on the given node
-func (r *ParseableConfigReconciler) findAgentPodOnNode(ctx context.Context, nodeName string) (*corev1.Pod, error) {
+func (r *ParseableConfigReconciler) findAgentPodOnNode(ctx context.Context, nodeName, namespace string) (*corev1.Pod, error) {
 	podList := &corev1.PodList{}
 	if err := r.List(ctx, podList,
-		client.InNamespace(otelOperatorNamespace),
+		client.InNamespace(namespace),
 		client.MatchingLabels{"app.kubernetes.io/name": "pai-agent"},
 	); err != nil {
 		return nil, err

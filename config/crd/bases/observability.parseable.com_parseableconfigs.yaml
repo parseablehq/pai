@@ -45,6 +45,12 @@ spec:
                   enabled:
                     description: Enabled controls whether Kubernetes events are collected
                     type: boolean
+                  headers:
+                    additionalProperties:
+                      type: string
+                    description: Headers are additional HTTP headers for the events
+                      exporter. Overrides global headers with the same key.
+                    type: object
                   namespaceSelector:
                     description: NamespaceSelector defines which namespaces to collect
                       events from
@@ -72,6 +78,12 @@ spec:
               logs:
                 description: Logs defines logging configuration
                 properties:
+                  headers:
+                    additionalProperties:
+                      type: string
+                    description: Headers are additional HTTP headers for the logs
+                      exporter. Overrides global headers with the same key.
+                    type: object
                   namespaceSelector:
                     description: NamespaceSelector defines which namespaces to collect
                       logs from
@@ -103,6 +115,13 @@ spec:
                     description: NodeMetrics controls collection of node-level metrics
                       via kubeletstats receiver
                     properties:
+                      headers:
+                        additionalProperties:
+                          type: string
+                        description: Headers are additional HTTP headers for the node
+                          metrics exporter. Overrides global headers with the same
+                          key.
+                        type: object
                       namespaceSelector:
                         description: NamespaceSelector defines which namespaces to
                           collect node metrics from
@@ -131,6 +150,13 @@ spec:
                     description: PodMetrics controls collection of pod/container-level
                       metrics via kubeletstats and k8s_cluster receivers
                     properties:
+                      headers:
+                        additionalProperties:
+                          type: string
+                        description: Headers are additional HTTP headers for the pod
+                          metrics exporter. Overrides global headers with the same
+                          key.
+                        type: object
                       namespaceSelector:
                         description: NamespaceSelector defines which namespaces to
                           collect pod metrics from
@@ -156,6 +182,11 @@ spec:
                     - targetDataset
                     type: object
                 type: object
+              paused:
+                description: |-
+                  Paused stops all data collection when set to true.
+                  Collectors, instrumentation, and agent are deleted. Set to false to resume.
+                type: boolean
               target:
                 description: Target defines the global Parseable endpoint and credentials
                 properties:
@@ -176,6 +207,16 @@ spec:
                   endpoint:
                     description: Endpoint is the Parseable API endpoint URL for ingestion
                     type: string
+                  globalTenantId:
+                    description: GlobalTenantID is an optional tenant identifier.
+                      When set, the X-P-Tenant header is added to all collector exporters.
+                    type: string
+                  headers:
+                    additionalProperties:
+                      type: string
+                    description: Headers are additional HTTP headers applied to all
+                      signal exporters. Signal-level headers override these.
+                    type: object
                 required:
                 - credentialsSecret
                 - endpoint
@@ -183,6 +224,12 @@ spec:
               traces:
                 description: Traces defines tracing configuration
                 properties:
+                  headers:
+                    additionalProperties:
+                      type: string
+                    description: Headers are additional HTTP headers for the traces
+                      exporter. Overrides global headers with the same key.
+                    type: object
                   instrumentation:
                     description: Instrumentation defines auto-instrumentation settings
                       for traces
