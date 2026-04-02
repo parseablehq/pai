@@ -224,7 +224,7 @@ kubectl delete namespace pai-system
 For a full cluster cleanup (including OTel operator resources), use the cleanup script:
 
 ```bash
-curl -sL https://gist.githubusercontent.com/AdheipSingh/0d468e7da14e7b58b66d127c846915d4/raw | bash
+curl -sL https://raw.githubusercontent.com/parseablehq/pai/refs/heads/main/scripts/cleanup.sh | bash
 ```
 
 ## Development

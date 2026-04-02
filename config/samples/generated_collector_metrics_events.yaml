@@ -54,7 +54,7 @@ spec:
     exporters:
       # Metrics exporter — sends to pai-metrics stream
       otlphttp/metrics:
-        endpoint: http://106.51.126.91:8010
+        endpoint: http://<YOUR_PARSEABLE_ENDPOINT>:8010
         headers:
           Authorization: "Basic <base64-encoded>"
           X-P-Log-Source: otel-metrics
@@ -62,7 +62,7 @@ spec:
 
       # Events exporter — sends to pai-events stream
       otlphttp/events:
-        endpoint: http://106.51.126.91:8010
+        endpoint: http://<YOUR_PARSEABLE_ENDPOINT>:8010
         headers:
           Authorization: "Basic <base64-encoded>"
           X-P-Log-Source: otel-logs

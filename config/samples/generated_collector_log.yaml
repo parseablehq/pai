@@ -42,7 +42,7 @@ spec:
       batch: {}
     exporters:
       otlphttp:
-        endpoint: http://106.51.126.91:8010
+        endpoint: http://<YOUR_PARSEABLE_ENDPOINT>:8010
         headers:
           Authorization: "Basic <base64-encoded>"
           X-P-Log-Source: otel-logs
