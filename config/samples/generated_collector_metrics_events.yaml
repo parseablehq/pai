@@ -1,0 +1,83 @@
+# This is the OpenTelemetryCollector CR that PAI generates when metrics and/or events are enabled.
+# PAI translates spec.metrics + spec.events into a single Deployment-mode collector with two pipelines.
+#
+# Input (from ParseableConfig):
+#   metrics:
+#     stream: pai-metrics
+#     namespaceSelector:
+#       mode: include
+#       namespaces: [demo]
+#     nodeMetrics:
+#       enabled: true
+#   events:
+#     enabled: true
+#     stream: pai-events
+#     namespaceSelector:
+#       mode: include
+#       namespaces: [demo]
+#
+apiVersion: opentelemetry.io/v1beta1
+kind: OpenTelemetryCollector
+metadata:
+  name: pai-metrics-events-collector
+  namespace: otel-operator
+spec:
+  mode: deployment
+  config:
+    receivers:
+      # Cluster-level metrics (deployments, pods, nodes, etc.)
+      k8s_cluster:
+        collection_interval: 30s
+
+      # Node-level metrics (CPU, memory, disk, network) — only if nodeMetrics.enabled
+      kubeletstats:
+        collection_interval: 30s
+        auth_type: serviceAccount
+        insecure_skip_verify: true
+
+      # Kubernetes events — only if events.enabled
+      k8sobjects:
+        objects:
+          - name: events
+            mode: watch
+            namespaces: [demo]    # from events.namespaceSelector (include mode)
+
+    processors:
+      # Namespace filter for metrics (OTTL syntax) — only if metrics.namespaceSelector is set
+      filter/metrics_ns:
+        error_mode: ignore
+        metrics:
+          datapoint:
+            - 'resource.attributes["k8s.namespace.name"] == nil or not IsMatch(resource.attributes["k8s.namespace.name"], "^(demo)$")'
+      batch: {}
+
+    exporters:
+      # Metrics exporter — sends to pai-metrics stream
+      otlphttp/metrics:
+        endpoint: http://<YOUR_PARSEABLE_ENDPOINT>:8010
+        headers:
+          Authorization: "Basic <base64-encoded>"
+          X-P-Log-Source: otel-metrics
+          X-P-Stream: pai-metrics
+
+      # Events exporter — sends to pai-events stream
+      otlphttp/events:
+        endpoint: http://<YOUR_PARSEABLE_ENDPOINT>:8010
+        headers:
+          Authorization: "Basic <base64-encoded>"
+          X-P-Log-Source: otel-logs
+          X-P-Stream: pai-events
+
+    service:
+      pipelines:
+        # Metrics pipeline
+        metrics:
+          receivers: [k8s_cluster, kubeletstats]
+          processors: [filter/metrics_ns, batch]
+          exporters: [otlphttp/metrics]
+
+        # Events pipeline (events are logs in OTel)
+        logs:
+          receivers: [k8sobjects]
+          processors: [batch]
+          exporters: [otlphttp/events]

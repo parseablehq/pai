@@ -1,0 +1,52 @@
+apiVersion: observability.parseable.com/v1alpha1
+kind: ParseableConfig
+metadata:
+  labels:
+    app.kubernetes.io/name: pai
+    app.kubernetes.io/managed-by: kustomize
+  name: production
+spec:
+  target:
+    endpoint: http://<YOUR_PARSEABLE_ENDPOINT>:8010
+    credentialsSecret:
+      name: parseable-creds
+      namespace: parseable-operator-system
+
+  traces:
+    targetDataset: pai-traces-ds
+    namespaceSelector:
+      mode: include
+      namespaces:
+        - demo
+    instrumentation:
+      languages:
+        - java
+        - python
+        - nodejs
+        - dotnet
+      detectionTimeout: "1m"
+
+  logs:
+    targetDataset: pai-logs
+    namespaceSelector:
+      mode: include
+      namespaces:
+        - demo
+
+  metrics:
+    podMetrics:
+      targetDataset: pai-pod-metrics
+      namespaceSelector:
+        mode: include
+        namespaces:
+          - demo
+    nodeMetrics:
+      targetDataset: pai-node-metrics
+
+  events:
+    enabled: true
+    targetDataset: pai-events
+    namespaceSelector:
+      mode: include
+      namespaces:
+        - demo

@@ -1,0 +1,441 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.17.2
+  name: parseableconfigs.observability.parseable.com
+spec:
+  group: observability.parseable.com
+  names:
+    kind: ParseableConfig
+    listKind: ParseableConfigList
+    plural: parseableconfigs
+    singular: parseableconfig
+  scope: Namespaced
+  versions:
+  - name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: ParseableConfig is the Schema for the parseableconfigs API
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: ParseableConfigSpec defines the desired state of ParseableConfig
+            properties:
+              events:
+                description: Events defines Kubernetes events collection configuration
+                properties:
+                  enabled:
+                    description: Enabled controls whether Kubernetes events are collected
+                    type: boolean
+                  headers:
+                    additionalProperties:
+                      type: string
+                    description: Headers are additional HTTP headers for the events
+                      exporter. Overrides global headers with the same key.
+                    type: object
+                  namespaceSelector:
+                    description: NamespaceSelector defines which namespaces to collect
+                      events from
+                    properties:
+                      mode:
+                        description: Mode specifies whether to include or exclude
+                          the listed namespaces
+                        enum:
+                        - include
+                        - exclude
+                        type: string
+                      namespaces:
+                        description: Namespaces is the list of namespace names
+                        items:
+                          type: string
+                        type: array
+                    type: object
+                  targetDataset:
+                    description: TargetDataset is the Parseable dataset name for event
+                      data
+                    type: string
+                required:
+                - enabled
+                type: object
+              logs:
+                description: Logs defines logging configuration
+                properties:
+                  headers:
+                    additionalProperties:
+                      type: string
+                    description: Headers are additional HTTP headers for the logs
+                      exporter. Overrides global headers with the same key.
+                    type: object
+                  namespaceSelector:
+                    description: NamespaceSelector defines which namespaces to collect
+                      logs from
+                    properties:
+                      mode:
+                        description: Mode specifies whether to include or exclude
+                          the listed namespaces
+                        enum:
+                        - include
+                        - exclude
+                        type: string
+                      namespaces:
+                        description: Namespaces is the list of namespace names
+                        items:
+                          type: string
+                        type: array
+                    type: object
+                  targetDataset:
+                    description: TargetDataset is the Parseable dataset name for log
+                      data
+                    type: string
+                required:
+                - targetDataset
+                type: object
+              metrics:
+                description: Metrics defines metrics configuration
+                properties:
+                  nodeMetrics:
+                    description: NodeMetrics controls collection of node-level metrics
+                      via kubeletstats receiver
+                    properties:
+                      headers:
+                        additionalProperties:
+                          type: string
+                        description: Headers are additional HTTP headers for the node
+                          metrics exporter. Overrides global headers with the same
+                          key.
+                        type: object
+                      namespaceSelector:
+                        description: NamespaceSelector defines which namespaces to
+                          collect node metrics from
+                        properties:
+                          mode:
+                            description: Mode specifies whether to include or exclude
+                              the listed namespaces
+                            enum:
+                            - include
+                            - exclude
+                            type: string
+                          namespaces:
+                            description: Namespaces is the list of namespace names
+                            items:
+                              type: string
+                            type: array
+                        type: object
+                      targetDataset:
+                        description: TargetDataset is the Parseable dataset name for
+                          node metric data
+                        type: string
+                    required:
+                    - targetDataset
+                    type: object
+                  podMetrics:
+                    description: PodMetrics controls collection of pod/container-level
+                      metrics via kubeletstats and k8s_cluster receivers
+                    properties:
+                      headers:
+                        additionalProperties:
+                          type: string
+                        description: Headers are additional HTTP headers for the pod
+                          metrics exporter. Overrides global headers with the same
+                          key.
+                        type: object
+                      namespaceSelector:
+                        description: NamespaceSelector defines which namespaces to
+                          collect pod metrics from
+                        properties:
+                          mode:
+                            description: Mode specifies whether to include or exclude
+                              the listed namespaces
+                            enum:
+                            - include
+                            - exclude
+                            type: string
+                          namespaces:
+                            description: Namespaces is the list of namespace names
+                            items:
+                              type: string
+                            type: array
+                        type: object
+                      targetDataset:
+                        description: TargetDataset is the Parseable dataset name for
+                          pod/container metric data
+                        type: string
+                    required:
+                    - targetDataset
+                    type: object
+                type: object
+              paused:
+                description: |-
+                  Paused stops all data collection when set to true.
+                  Collectors, instrumentation, and agent are deleted. Set to false to resume.
+                type: boolean
+              target:
+                description: Target defines the global Parseable endpoint and credentials
+                properties:
+                  credentialsSecret:
+                    description: CredentialsSecret references the secret containing
+                      authentication credentials
+                    properties:
+                      name:
+                        description: Name is the name of the secret
+                        type: string
+                      namespace:
+                        description: Namespace is the namespace of the secret
+                        type: string
+                    required:
+                    - name
+                    - namespace
+                    type: object
+                  endpoint:
+                    description: Endpoint is the Parseable API endpoint URL for ingestion
+                    type: string
+                  globalTenantId:
+                    description: GlobalTenantID is an optional tenant identifier.
+                      When set, the X-P-Tenant header is added to all collector exporters.
+                    type: string
+                  headers:
+                    additionalProperties:
+                      type: string
+                    description: Headers are additional HTTP headers applied to all
+                      signal exporters. Signal-level headers override these.
+                    type: object
+                required:
+                - credentialsSecret
+                - endpoint
+                type: object
+              traces:
+                description: Traces defines tracing configuration
+                properties:
+                  headers:
+                    additionalProperties:
+                      type: string
+                    description: Headers are additional HTTP headers for the traces
+                      exporter. Overrides global headers with the same key.
+                    type: object
+                  instrumentation:
+                    description: Instrumentation defines auto-instrumentation settings
+                      for traces
+                    properties:
+                      detectionTimeout:
+                        description: |-
+                          DetectionTimeout is how long (e.g. "60s", "2m") to wait during auto-detection.
+                          Defaults to "1m" if not set.
+                        type: string
+                      languages:
+                        description: Languages specifies which programming languages
+                          to instrument
+                        items:
+                          type: string
+                        type: array
+                    type: object
+                  namespaceSelector:
+                    description: NamespaceSelector defines which namespaces to target
+                      for tracing
+                    properties:
+                      mode:
+                        description: Mode specifies whether to include or exclude
+                          the listed namespaces
+                        enum:
+                        - include
+                        - exclude
+                        type: string
+                      namespaces:
+                        description: Namespaces is the list of namespace names
+                        items:
+                          type: string
+                        type: array
+                    type: object
+                  targetDataset:
+                    description: TargetDataset is the Parseable dataset name for trace
+                      data
+                    type: string
+                  workloadSelector:
+                    description: WorkloadSelector defines which workloads to include
+                      or exclude by labels
+                    properties:
+                      matchExpressions:
+                        description: matchExpressions is a list of label selector
+                          requirements. The requirements are ANDed.
+                        items:
+                          description: |-
+                            A label selector requirement is a selector that contains values, a key, and an operator that
+                            relates the key and values.
+                          properties:
+                            key:
+                              description: key is the label key that the selector
+                                applies to.
+                              type: string
+                            operator:
+                              description: |-
+                                operator represents a key's relationship to a set of values.
+                                Valid operators are In, NotIn, Exists and DoesNotExist.
+                              type: string
+                            values:
+                              description: |-
+                                values is an array of string values. If the operator is In or NotIn,
+                                the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                                the values array must be empty. This array is replaced during a strategic
+                                merge patch.
+                              items:
+                                type: string
+                              type: array
+                              x-kubernetes-list-type: atomic
+                          required:
+                          - key
+                          - operator
+                          type: object
+                        type: array
+                        x-kubernetes-list-type: atomic
+                      matchLabels:
+                        additionalProperties:
+                          type: string
+                        description: |-
+                          matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                          map is equivalent to an element of matchExpressions, whose key field is "key", the
+                          operator is "In", and the values array contains only "value". The requirements are ANDed.
+                        type: object
+                      mode:
+                        description: Mode specifies whether to include or exclude
+                          workloads matching the selector
+                        enum:
+                        - include
+                        - exclude
+                        type: string
+                    type: object
+                    x-kubernetes-map-type: atomic
+                required:
+                - targetDataset
+                type: object
+            required:
+            - target
+            type: object
+          status:
+            description: ParseableConfigStatus defines the observed state of ParseableConfig
+            properties:
+              conditions:
+                description: Conditions represent the latest available observations
+                  of the resource's state
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              workloads:
+                description: Workloads tracks the instrumentation status of each processed
+                  workload
+                items:
+                  description: WorkloadInstrumentationStatus tracks the detection
+                    result for a single workload
+                  properties:
+                    containerImage:
+                      description: ContainerImage is the image that was running when
+                        detection was performed
+                      type: string
+                    detectedLanguage:
+                      description: DetectedLanguage is the language that was detected
+                        (empty if none matched)
+                      type: string
+                    instrumented:
+                      description: Instrumented indicates whether the workload was
+                        successfully instrumented
+                      type: boolean
+                    kind:
+                      description: Kind is Deployment or StatefulSet
+                      type: string
+                    lastDetectionTime:
+                      description: LastDetectionTime is when detection was last performed
+                      format: date-time
+                      type: string
+                    name:
+                      description: Name of the workload
+                      type: string
+                    namespace:
+                      description: Namespace of the workload
+                      type: string
+                    observedGeneration:
+                      description: ObservedGeneration is the CR generation when this
+                        workload was last processed
+                      format: int64
+                      type: integer
+                  required:
+                  - instrumented
+                  - kind
+                  - name
+                  - namespace
+                  - observedGeneration
+                  type: object
+                type: array
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

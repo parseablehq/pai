@@ -1,0 +1,55 @@
+# This is the OpenTelemetryCollector CR that PAI generates when logs are enabled.
+# PAI translates spec.logs into this DaemonSet-mode collector.
+#
+# Input (from ParseableConfig):
+#   logs:
+#     stream: pai-logs
+#     namespaceSelector:
+#       mode: include
+#       namespaces: [demo]
+#
+apiVersion: opentelemetry.io/v1beta1
+kind: OpenTelemetryCollector
+metadata:
+  name: pai-log-collector
+  namespace: otel-operator
+spec:
+  mode: daemonset
+  volumes:
+    - name: varlogpods
+      hostPath:
+        path: /var/log/pods
+  volumeMounts:
+    - name: varlogpods
+      mountPath: /var/log/pods
+      readOnly: true
+  config:
+    receivers:
+      filelog:
+        include:
+          - /var/log/pods/demo_*/*/*.log
+        operators:
+          - type: container
+            id: container-parser
+    processors:
+      k8sattributes:
+        extract:
+          metadata:
+            - k8s.namespace.name
+            - k8s.pod.name
+            - k8s.container.name
+            - k8s.node.name
+      batch: {}
+    exporters:
+      otlphttp:
+        endpoint: http://<YOUR_PARSEABLE_ENDPOINT>:8010
+        headers:
+          Authorization: "Basic <base64-encoded>"
+          X-P-Log-Source: otel-logs
+          X-P-Stream: pai-logs
+    service:
+      pipelines:
+        logs:
+          receivers: [filelog]
+          processors: [k8sattributes, batch]
+          exporters: [otlphttp]

@@ -1,0 +1,36 @@
+apiVersion: observability.parseable.com/v1alpha1
+kind: ParseableConfig
+metadata:
+  labels:
+    app.kubernetes.io/name: pai
+    app.kubernetes.io/managed-by: kustomize
+  name: production-matchexpression
+spec:
+  namespaceSelector:
+    mode: include
+    namespaces:
+      - demo
+
+  # matchLabels: simple key=value equality
+  # A workload must have ALL listed labels to match.
+  # This example includes only paymentservice, currencyservice, and recommendationservice.
+  workloadSelector:
+    mode: include
+    matchLabels:
+      app: paymentservice
+
+  target:
+    endpoint: http://<YOUR_PARSEABLE_ENDPOINT>:8010
+    credentialsSecret:
+      name: parseable-creds
+      namespace: parseable-operator-system
+    streams:
+      traces: prod-traces-demo-new
+
+  instrumentation:
+    languages:
+      - java
+      - python
+      - nodejs
+      - dotnet
+    detectionTimeout: "1m"
