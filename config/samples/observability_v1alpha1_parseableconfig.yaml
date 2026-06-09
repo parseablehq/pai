@@ -27,21 +27,36 @@ spec:
       detectionTimeout: "1m"
 
   logs:
-    targetDataset: pai-logs
-    namespaceSelector:
-      mode: include
-      namespaces:
-        - demo
-
-  metrics:
-    podMetrics:
-      targetDataset: pai-pod-metrics
+    podLogs:
+      enabled: true
+      targetDataset: pai-logs
       namespaceSelector:
         mode: include
         namespaces:
           - demo
-    nodeMetrics:
-      targetDataset: pai-node-metrics
+    files:
+      - name: app audit logs
+        hostPath: /var/log/app/audit
+        targetDataset: pai-app-audit
+
+  metrics:
+    clusterMetrics:
+      targetDataset: pai-cluster-metrics
+      k8sCluster:
+        enabled: true
+        nodeConditions: [Ready, DiskPressure, MemoryPressure, PIDPressure, NetworkUnavailable]
+        allocatableResources: [cpu, memory, storage]
+      kubelet:
+        enabled: true
+      kubeState:
+        enabled: true
+    scrapeConfigs:
+      - name: app metrics
+        uri: /metrics
+        port: 8080
+        targetDataset: pai-app-metrics
+        podSelector:
+          app.kubernetes.io/name: my-app
 
   events:
     enabled: true

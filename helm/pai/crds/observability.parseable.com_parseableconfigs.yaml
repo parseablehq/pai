@@ -76,90 +76,58 @@ spec:
                 - enabled
                 type: object
               logs:
-                description: Logs defines logging configuration
+                description: Logs defines logging configuration (built-in pod logs
+                  toggle + host-path tail pipelines)
                 properties:
-                  headers:
-                    additionalProperties:
-                      type: string
-                    description: Headers are additional HTTP headers for the logs
-                      exporter. Overrides global headers with the same key.
-                    type: object
-                  namespaceSelector:
-                    description: NamespaceSelector defines which namespaces to collect
-                      logs from
-                    properties:
-                      mode:
-                        description: Mode specifies whether to include or exclude
-                          the listed namespaces
-                        enum:
-                        - include
-                        - exclude
-                        type: string
-                      namespaces:
-                        description: Namespaces is the list of namespace names
-                        items:
-                          type: string
-                        type: array
-                    type: object
-                  targetDataset:
-                    description: TargetDataset is the Parseable dataset name for log
-                      data
-                    type: string
-                required:
-                - targetDataset
-                type: object
-              metrics:
-                description: Metrics defines metrics configuration
-                properties:
-                  nodeMetrics:
-                    description: NodeMetrics controls collection of node-level metrics
-                      via kubeletstats receiver
-                    properties:
-                      headers:
-                        additionalProperties:
-                          type: string
-                        description: Headers are additional HTTP headers for the node
-                          metrics exporter. Overrides global headers with the same
-                          key.
-                        type: object
-                      namespaceSelector:
-                        description: NamespaceSelector defines which namespaces to
-                          collect node metrics from
-                        properties:
-                          mode:
-                            description: Mode specifies whether to include or exclude
-                              the listed namespaces
-                            enum:
-                            - include
-                            - exclude
+                  files:
+                    description: Files is a list of host-path tail pipelines (e.g.
+                      audit logs, server logs).
+                    items:
+                      description: |-
+                        FileLogConfig defines a host-path tail pipeline. Every *.log file under
+                        HostPath (recursive) is tailed without CRI/container parsing.
+                      properties:
+                        headers:
+                          additionalProperties:
                             type: string
-                          namespaces:
-                            description: Namespaces is the list of namespace names
-                            items:
-                              type: string
-                            type: array
-                        type: object
-                      targetDataset:
-                        description: TargetDataset is the Parseable dataset name for
-                          node metric data
-                        type: string
-                    required:
-                    - targetDataset
-                    type: object
-                  podMetrics:
-                    description: PodMetrics controls collection of pod/container-level
-                      metrics via kubeletstats and k8s_cluster receivers
+                          description: Headers are additional HTTP headers for this
+                            exporter. Overrides global headers with the same key.
+                          type: object
+                        hostPath:
+                          description: HostPath is the directory on the node to mount
+                            and tail recursively
+                          type: string
+                        name:
+                          description: Name uniquely identifies this file pipeline;
+                            used to name the receiver, exporter, volume, and pipeline.
+                          type: string
+                        targetDataset:
+                          description: TargetDataset is the Parseable dataset name
+                            for this pipeline's log data
+                          type: string
+                      required:
+                      - hostPath
+                      - name
+                      - targetDataset
+                      type: object
+                    type: array
+                  podLogs:
+                    description: PodLogs enables collection of all Kubernetes pod
+                      logs from /var/log/pods on each node.
                     properties:
+                      enabled:
+                        description: Enabled controls whether Kubernetes pod logs
+                          are collected
+                        type: boolean
                       headers:
                         additionalProperties:
                           type: string
                         description: Headers are additional HTTP headers for the pod
-                          metrics exporter. Overrides global headers with the same
-                          key.
+                          logs exporter. Overrides global headers with the same key.
                         type: object
                       namespaceSelector:
                         description: NamespaceSelector defines which namespaces to
-                          collect pod metrics from
+                          collect pod logs from
                         properties:
                           mode:
                             description: Mode specifies whether to include or exclude
@@ -176,11 +144,168 @@ spec:
                         type: object
                       targetDataset:
                         description: TargetDataset is the Parseable dataset name for
-                          pod/container metric data
+                          pod log data (required when Enabled is true)
+                        type: string
+                    required:
+                    - enabled
+                    type: object
+                type: object
+              metrics:
+                description: Metrics defines metrics configuration (cluster metrics
+                  toggle + scrape configs)
+                properties:
+                  clusterMetrics:
+                    description: ClusterMetrics toggles built-in node/pod/cluster
+                      metrics via kubeletstats + k8s_cluster receivers
+                    properties:
+                      headers:
+                        additionalProperties:
+                          type: string
+                        description: Headers are additional HTTP headers for the cluster
+                          metrics exporter. Overrides global headers with the same
+                          key.
+                        type: object
+                      k8sCluster:
+                        description: K8sCluster collects cluster object state (pod/deployment
+                          status, node conditions) via the k8s_cluster receiver.
+                        properties:
+                          allocatableResources:
+                            description: |-
+                              AllocatableResources is the list of allocatable resources to report (e.g. cpu, memory, storage).
+                              Defaults to no allocatable metrics when empty.
+                            items:
+                              type: string
+                            type: array
+                          enabled:
+                            description: Enabled controls whether the k8s_cluster
+                              receiver runs
+                            type: boolean
+                          nodeConditions:
+                            description: |-
+                              NodeConditions is the list of node conditions to report (e.g. Ready, DiskPressure, MemoryPressure).
+                              Defaults to ["Ready"] when empty.
+                            items:
+                              type: string
+                            type: array
+                        required:
+                        - enabled
+                        type: object
+                      kubeState:
+                        description: KubeState scrapes the kube-state-metrics service
+                          via Kubernetes service discovery.
+                        properties:
+                          enabled:
+                            description: Enabled controls whether kube-state-metrics
+                              scraping runs
+                            type: boolean
+                          namespaces:
+                            description: |-
+                              Namespaces restricts where the kube-state-metrics service is discovered.
+                              Defaults to ["kube-system", "kube-state-metrics", "default"] when empty.
+                            items:
+                              type: string
+                            type: array
+                        required:
+                        - enabled
+                        type: object
+                      kubelet:
+                        description: Kubelet scrapes each node's kubelet /metrics
+                          endpoint (Prometheus format, TLS + service-account bearer).
+                        properties:
+                          enabled:
+                            description: Enabled controls whether kubelet /metrics
+                              scraping runs
+                            type: boolean
+                        required:
+                        - enabled
+                        type: object
+                      namespaceSelector:
+                        description: NamespaceSelector filters pod-scope metrics by
+                          namespace. Node-scope metrics are not filtered.
+                        properties:
+                          mode:
+                            description: Mode specifies whether to include or exclude
+                              the listed namespaces
+                            enum:
+                            - include
+                            - exclude
+                            type: string
+                          namespaces:
+                            description: Namespaces is the list of namespace names
+                            items:
+                              type: string
+                            type: array
+                        type: object
+                      targetDataset:
+                        description: TargetDataset is the Parseable dataset name shared
+                          by every enabled built-in receiver
                         type: string
                     required:
                     - targetDataset
                     type: object
+                  scrapeConfigs:
+                    description: ScrapeConfigs is a list of Prometheus-style scrape
+                      pipelines
+                    items:
+                      description: |-
+                        ScrapeConfig defines a single Prometheus-style scrape pipeline. Pods are
+                        discovered via Kubernetes service discovery and scraped at the given path+port.
+                        Two pod-selection modes are supported:
+                          - PodSelector (label match) — recommended; matches pods by label key/value
+                          - port-only — keeps pods whose container exposes the named port (legacy)
+                      properties:
+                        headers:
+                          additionalProperties:
+                            type: string
+                          description: Headers are additional HTTP headers for this
+                            exporter. Overrides global headers with the same key.
+                          type: object
+                        name:
+                          description: Name uniquely identifies this scrape pipeline
+                          type: string
+                        namespaceSelector:
+                          description: NamespaceSelector limits service discovery
+                            to the matching namespaces
+                          properties:
+                            mode:
+                              description: Mode specifies whether to include or exclude
+                                the listed namespaces
+                              enum:
+                              - include
+                              - exclude
+                              type: string
+                            namespaces:
+                              description: Namespaces is the list of namespace names
+                              items:
+                                type: string
+                              type: array
+                          type: object
+                        podSelector:
+                          additionalProperties:
+                            type: string
+                          description: |-
+                            PodSelector selects pods by label key/value pairs. When set, the operator emits
+                            a Prometheus keep-relabel per label and skips the port-number filter.
+                          type: object
+                        port:
+                          description: Port is the container port to scrape
+                          format: int32
+                          type: integer
+                        targetDataset:
+                          description: TargetDataset is the Parseable dataset name
+                            for this scrape pipeline's metric data
+                          type: string
+                        uri:
+                          description: URI is the HTTP path to scrape on each discovered
+                            pod (e.g. "/metrics")
+                          type: string
+                      required:
+                      - name
+                      - port
+                      - targetDataset
+                      - uri
+                      type: object
+                    type: array
                 type: object
               paused:
                 description: |-

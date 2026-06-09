@@ -1,12 +1,25 @@
-# This is the OpenTelemetryCollector CR that PAI generates when logs are enabled.
-# PAI translates spec.logs into this DaemonSet-mode collector.
+# This is the OpenTelemetryCollector CR that PAI generates for the log DaemonSet.
+# PAI builds three kinds of pipelines inside this collector:
+#   - one pod-logs pipeline (when spec.logs.podLogs.enabled) tailing /var/log/pods with CRI parsing
+#   - one file pipeline per spec.logs.files[] entry tailing the configured host-path recursively
+#   - one cluster-metrics pipeline (when spec.metrics.clusterMetrics.enabled) using kubeletstats
 #
 # Input (from ParseableConfig):
 #   logs:
-#     stream: pai-logs
-#     namespaceSelector:
-#       mode: include
-#       namespaces: [demo]
+#     podLogs:
+#       enabled: true
+#       targetDataset: pai-logs
+#       namespaceSelector:
+#         mode: include
+#         namespaces: [demo]
+#     files:
+#       - name: app audit logs
+#         hostPath: /var/log/app/audit
+#         targetDataset: pai-app-audit
+#   metrics:
+#     clusterMetrics:
+#       enabled: true
+#       targetDataset: pai-cluster-metrics
 #
 apiVersion: opentelemetry.io/v1beta1
 kind: OpenTelemetryCollector
@@ -16,21 +29,38 @@ metadata:
 spec:
   mode: daemonset
   volumes:
-    - name: varlogpods
+    - name: pod-logs
       hostPath:
         path: /var/log/pods
+    - name: app-audit-logs
+      hostPath:
+        path: /var/log/app/audit
   volumeMounts:
-    - name: varlogpods
+    - name: pod-logs
       mountPath: /var/log/pods
+      readOnly: true
+    - name: app-audit-logs
+      mountPath: /var/log/app/audit
       readOnly: true
   config:
     receivers:
-      filelog:
+      filelog/pod-logs:
         include:
           - /var/log/pods/demo_*/*/*.log
+        include_file_path: true
         operators:
           - type: container
             id: container-parser
+      filelog/app-audit-logs:
+        include:
+          - /var/log/app/audit/*.log
+          - /var/log/app/audit/**/*.log
+        include_file_path: true
+      kubeletstats:
+        collection_interval: 30s
+        auth_type: serviceAccount
+        endpoint: https://${env:K8S_NODE_NAME}:10250
+        insecure_skip_verify: true
     processors:
       k8sattributes:
         extract:
@@ -41,15 +71,35 @@ spec:
             - k8s.node.name
       batch: {}
     exporters:
-      otlphttp:
+      otlphttp/logs_pod-logs:
         endpoint: http://<YOUR_PARSEABLE_ENDPOINT>:8010
         headers:
           Authorization: "Basic <base64-encoded>"
           X-P-Log-Source: otel-logs
           X-P-Stream: pai-logs
+      otlphttp/logs_app-audit-logs:
+        endpoint: http://<YOUR_PARSEABLE_ENDPOINT>:8010
+        headers:
+          Authorization: "Basic <base64-encoded>"
+          X-P-Log-Source: otel-logs
+          X-P-Stream: pai-app-audit
+      otlphttp/clustermetrics:
+        endpoint: http://<YOUR_PARSEABLE_ENDPOINT>:8010
+        headers:
+          Authorization: "Basic <base64-encoded>"
+          X-P-Log-Source: otel-metrics
+          X-P-Stream: pai-cluster-metrics
     service:
       pipelines:
-        logs:
-          receivers: [filelog]
+        logs/pod-logs:
+          receivers: [filelog/pod-logs]
           processors: [k8sattributes, batch]
-          exporters: [otlphttp]
+          exporters: [otlphttp/logs_pod-logs]
+        logs/app-audit-logs:
+          receivers: [filelog/app-audit-logs]
+          processors: [batch]
+          exporters: [otlphttp/logs_app-audit-logs]
+        metrics/cluster:
+          receivers: [kubeletstats]
+          processors: [batch]
+          exporters: [otlphttp/clustermetrics]

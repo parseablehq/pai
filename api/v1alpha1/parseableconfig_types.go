@@ -93,49 +93,138 @@ type TracesConfig struct {
 	Instrumentation InstrumentationConfig `json:"instrumentation,omitempty"`
 }
 
-// LogsConfig defines logging configuration
+// LogsConfig defines logging configuration: a built-in toggle for cluster pod
+// logs plus an array of host-path tail pipelines for arbitrary log directories.
 type LogsConfig struct {
-	// TargetDataset is the Parseable dataset name for log data
-	TargetDataset string `json:"targetDataset"`
+	// PodLogs enables collection of all Kubernetes pod logs from /var/log/pods on each node.
+	PodLogs *PodLogsConfig `json:"podLogs,omitempty"`
 
-	// Headers are additional HTTP headers for the logs exporter. Overrides global headers with the same key.
+	// Files is a list of host-path tail pipelines (e.g. audit logs, server logs).
+	Files []FileLogConfig `json:"files,omitempty"`
+}
+
+// PodLogsConfig configures collection of Kubernetes pod logs via the filelog
+// receiver with CRI container parsing and optional namespace filtering.
+type PodLogsConfig struct {
+	// Enabled controls whether Kubernetes pod logs are collected
+	Enabled bool `json:"enabled"`
+
+	// TargetDataset is the Parseable dataset name for pod log data (required when Enabled is true)
+	TargetDataset string `json:"targetDataset,omitempty"`
+
+	// Headers are additional HTTP headers for the pod logs exporter. Overrides global headers with the same key.
 	Headers map[string]string `json:"headers,omitempty"`
 
-	// NamespaceSelector defines which namespaces to collect logs from
+	// NamespaceSelector defines which namespaces to collect pod logs from
 	NamespaceSelector NamespaceSelector `json:"namespaceSelector,omitempty"`
 }
 
-// PodMetricsConfig defines pod/container-level metrics collection settings
-type PodMetricsConfig struct {
-	// TargetDataset is the Parseable dataset name for pod/container metric data
+// FileLogConfig defines a host-path tail pipeline. Every *.log file under
+// HostPath (recursive) is tailed without CRI/container parsing.
+type FileLogConfig struct {
+	// Name uniquely identifies this file pipeline; used to name the receiver, exporter, volume, and pipeline.
+	Name string `json:"name"`
+
+	// HostPath is the directory on the node to mount and tail recursively
+	HostPath string `json:"hostPath"`
+
+	// TargetDataset is the Parseable dataset name for this pipeline's log data
 	TargetDataset string `json:"targetDataset"`
 
-	// Headers are additional HTTP headers for the pod metrics exporter. Overrides global headers with the same key.
+	// Headers are additional HTTP headers for this exporter. Overrides global headers with the same key.
 	Headers map[string]string `json:"headers,omitempty"`
-
-	// NamespaceSelector defines which namespaces to collect pod metrics from
-	NamespaceSelector NamespaceSelector `json:"namespaceSelector,omitempty"`
 }
 
-// NodeMetricsConfig defines node-level metrics collection settings
-type NodeMetricsConfig struct {
-	// TargetDataset is the Parseable dataset name for node metric data
+// ClusterMetricsConfig enables built-in cluster-wide metrics from up to three
+// receivers (k8s_cluster, kubelet /metrics, kube-state-metrics). All enabled
+// receivers ship to the same TargetDataset.
+type ClusterMetricsConfig struct {
+	// TargetDataset is the Parseable dataset name shared by every enabled built-in receiver
 	TargetDataset string `json:"targetDataset"`
 
-	// Headers are additional HTTP headers for the node metrics exporter. Overrides global headers with the same key.
+	// Headers are additional HTTP headers for the cluster metrics exporter. Overrides global headers with the same key.
 	Headers map[string]string `json:"headers,omitempty"`
 
-	// NamespaceSelector defines which namespaces to collect node metrics from
+	// NamespaceSelector filters pod-scope metrics by namespace. Node-scope metrics are not filtered.
 	NamespaceSelector NamespaceSelector `json:"namespaceSelector,omitempty"`
+
+	// K8sCluster collects cluster object state (pod/deployment status, node conditions) via the k8s_cluster receiver.
+	K8sCluster *K8sClusterConfig `json:"k8sCluster,omitempty"`
+
+	// Kubelet scrapes each node's kubelet /metrics endpoint (Prometheus format, TLS + service-account bearer).
+	Kubelet *KubeletConfig `json:"kubelet,omitempty"`
+
+	// KubeState scrapes the kube-state-metrics service via Kubernetes service discovery.
+	KubeState *KubeStateConfig `json:"kubeState,omitempty"`
 }
 
-// MetricsConfig defines metrics configuration
+// K8sClusterConfig configures the k8s_cluster receiver.
+type K8sClusterConfig struct {
+	// Enabled controls whether the k8s_cluster receiver runs
+	Enabled bool `json:"enabled"`
+
+	// NodeConditions is the list of node conditions to report (e.g. Ready, DiskPressure, MemoryPressure).
+	// Defaults to ["Ready"] when empty.
+	NodeConditions []string `json:"nodeConditions,omitempty"`
+
+	// AllocatableResources is the list of allocatable resources to report (e.g. cpu, memory, storage).
+	// Defaults to no allocatable metrics when empty.
+	AllocatableResources []string `json:"allocatableResources,omitempty"`
+}
+
+// KubeletConfig configures the prometheus scrape of each node's kubelet /metrics endpoint.
+type KubeletConfig struct {
+	// Enabled controls whether kubelet /metrics scraping runs
+	Enabled bool `json:"enabled"`
+}
+
+// KubeStateConfig configures the prometheus scrape of the kube-state-metrics service.
+type KubeStateConfig struct {
+	// Enabled controls whether kube-state-metrics scraping runs
+	Enabled bool `json:"enabled"`
+
+	// Namespaces restricts where the kube-state-metrics service is discovered.
+	// Defaults to ["kube-system", "kube-state-metrics", "default"] when empty.
+	Namespaces []string `json:"namespaces,omitempty"`
+}
+
+// ScrapeConfig defines a single Prometheus-style scrape pipeline. Pods are
+// discovered via Kubernetes service discovery and scraped at the given path+port.
+// Two pod-selection modes are supported:
+//   - PodSelector (label match) — recommended; matches pods by label key/value
+//   - port-only — keeps pods whose container exposes the named port (legacy)
+type ScrapeConfig struct {
+	// Name uniquely identifies this scrape pipeline
+	Name string `json:"name"`
+
+	// URI is the HTTP path to scrape on each discovered pod (e.g. "/metrics")
+	URI string `json:"uri"`
+
+	// Port is the container port to scrape
+	Port int32 `json:"port"`
+
+	// TargetDataset is the Parseable dataset name for this scrape pipeline's metric data
+	TargetDataset string `json:"targetDataset"`
+
+	// Headers are additional HTTP headers for this exporter. Overrides global headers with the same key.
+	Headers map[string]string `json:"headers,omitempty"`
+
+	// NamespaceSelector limits service discovery to the matching namespaces
+	NamespaceSelector NamespaceSelector `json:"namespaceSelector,omitempty"`
+
+	// PodSelector selects pods by label key/value pairs. When set, the operator emits
+	// a Prometheus keep-relabel per label and skips the port-number filter.
+	PodSelector map[string]string `json:"podSelector,omitempty"`
+}
+
+// MetricsConfig defines metrics configuration. ClusterMetrics enables built-in
+// kubelet/cluster metrics; ScrapeConfigs adds Prometheus-style scrape pipelines.
 type MetricsConfig struct {
-	// PodMetrics controls collection of pod/container-level metrics via kubeletstats and k8s_cluster receivers
-	PodMetrics *PodMetricsConfig `json:"podMetrics,omitempty"`
+	// ClusterMetrics toggles built-in node/pod/cluster metrics via kubeletstats + k8s_cluster receivers
+	ClusterMetrics *ClusterMetricsConfig `json:"clusterMetrics,omitempty"`
 
-	// NodeMetrics controls collection of node-level metrics via kubeletstats receiver
-	NodeMetrics *NodeMetricsConfig `json:"nodeMetrics,omitempty"`
+	// ScrapeConfigs is a list of Prometheus-style scrape pipelines
+	ScrapeConfigs []ScrapeConfig `json:"scrapeConfigs,omitempty"`
 }
 
 // EventsConfig defines Kubernetes events collection configuration
@@ -165,10 +254,10 @@ type ParseableConfigSpec struct {
 	// Traces defines tracing configuration
 	Traces *TracesConfig `json:"traces,omitempty"`
 
-	// Logs defines logging configuration
+	// Logs defines logging configuration (built-in pod logs toggle + host-path tail pipelines)
 	Logs *LogsConfig `json:"logs,omitempty"`
 
-	// Metrics defines metrics configuration
+	// Metrics defines metrics configuration (cluster metrics toggle + scrape configs)
 	Metrics *MetricsConfig `json:"metrics,omitempty"`
 
 	// Events defines Kubernetes events collection configuration

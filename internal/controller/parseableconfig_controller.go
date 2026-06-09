@@ -425,7 +425,9 @@ func (r *ParseableConfigReconciler) ensureInstrumentation(ctx context.Context, c
 }
 
 // ensureLogCollector creates or updates a DaemonSet-mode OpenTelemetryCollector CR for log collection.
-// If logs are not configured, it deletes any existing log collector.
+// The DaemonSet hosts filelog pipelines (one per Logs[] entry) and, when ClusterMetrics is enabled,
+// a kubeletstats pipeline that scrapes each node's local kubelet for pod+node resource metrics.
+// If neither is configured, it deletes any existing log collector.
 func (r *ParseableConfigReconciler) ensureLogCollector(ctx context.Context, config *observabilityv1alpha1.ParseableConfig) error {
 	logger := log.FromContext(ctx)
 
@@ -439,8 +441,22 @@ func (r *ParseableConfigReconciler) ensureLogCollector(ctx context.Context, conf
 	existing.SetGroupVersionKind(gvk)
 	err := r.Get(ctx, client.ObjectKey{Name: logCollectorName, Namespace: config.Namespace}, existing)
 
-	// If logs not configured, clean up any existing collector and return
-	if config.Spec.Logs == nil || config.Spec.Logs.TargetDataset == "" {
+	podLogsEnabled := config.Spec.Logs != nil &&
+		config.Spec.Logs.PodLogs != nil &&
+		config.Spec.Logs.PodLogs.Enabled &&
+		config.Spec.Logs.PodLogs.TargetDataset != ""
+
+	hasFiles := false
+	if config.Spec.Logs != nil {
+		for _, f := range config.Spec.Logs.Files {
+			if f.Name != "" && f.HostPath != "" && f.TargetDataset != "" {
+				hasFiles = true
+				break
+			}
+		}
+	}
+
+	if !podLogsEnabled && !hasFiles {
 		if err == nil {
 			logger.Info("Logs not configured, deleting log collector")
 			if delErr := r.Delete(ctx, existing); delErr != nil && !errors.IsNotFound(delErr) {
@@ -455,24 +471,50 @@ func (r *ParseableConfigReconciler) ensureLogCollector(ctx context.Context, conf
 		return cfgErr
 	}
 
+	// Build hostPath volumes/mounts: /var/log/pods for podLogs, plus each Files entry.
+	volumes := []interface{}{}
+	volumeMounts := []interface{}{}
+	seen := map[string]bool{}
+	addVolume := func(name, hostPath string) {
+		if hostPath == "" || seen[hostPath] {
+			return
+		}
+		seen[hostPath] = true
+		volumes = append(volumes, map[string]interface{}{
+			"name":     name,
+			"hostPath": map[string]interface{}{"path": hostPath},
+		})
+		volumeMounts = append(volumeMounts, map[string]interface{}{
+			"name":      name,
+			"mountPath": hostPath,
+			"readOnly":  true,
+		})
+	}
+	if podLogsEnabled {
+		addVolume("pod-logs", "/var/log/pods")
+	}
+	if config.Spec.Logs != nil {
+		for _, f := range config.Spec.Logs.Files {
+			volName := sanitizeName(f.Name)
+			if volName == "" {
+				volName = sanitizeName(f.HostPath)
+			}
+			addVolume(volName, f.HostPath)
+		}
+	}
+
 	spec := map[string]interface{}{
 		"mode":   "daemonset",
 		"config": collectorConfig,
-		"volumes": []interface{}{
-			map[string]interface{}{
-				"name": "varlogpods",
-				"hostPath": map[string]interface{}{
-					"path": "/var/log/pods",
-				},
-			},
+		// Tolerate every taint so the log DaemonSet can run on every node — required to
+		// collect cluster-wide pod logs and host-path logs that live on tainted nodepools.
+		"tolerations": []interface{}{
+			map[string]interface{}{"operator": "Exists"},
 		},
-		"volumeMounts": []interface{}{
-			map[string]interface{}{
-				"name":      "varlogpods",
-				"mountPath": "/var/log/pods",
-				"readOnly":  true,
-			},
-		},
+	}
+	if len(volumes) > 0 {
+		spec["volumes"] = volumes
+		spec["volumeMounts"] = volumeMounts
 	}
 
 	if err == nil {
@@ -511,59 +553,22 @@ func (r *ParseableConfigReconciler) ensureLogCollector(ctx context.Context, conf
 	return nil
 }
 
-// buildLogCollectorConfig builds the OTel collector pipeline config YAML for log collection.
-// It uses the filelog receiver with include/exclude patterns based on the namespace selector,
-// k8sattributes processor for metadata enrichment, and otlphttp exporter for Parseable.
+// buildLogCollectorConfig builds the OTel collector pipeline config for the log DaemonSet.
+// Each Logs[] entry becomes its own filelog receiver + exporter pair. If ClusterMetrics is enabled,
+// a single kubeletstats receiver feeds pod+node resource metrics into the same target dataset.
 func (r *ParseableConfigReconciler) buildLogCollectorConfig(ctx context.Context, config *observabilityv1alpha1.ParseableConfig) (map[string]interface{}, error) {
-	logs := config.Spec.Logs
-
-	// Build filelog include/exclude patterns from namespace selector
-	var includePatterns, excludePatterns []interface{}
-
-	switch logs.NamespaceSelector.Mode {
-	case "include":
-		for _, ns := range logs.NamespaceSelector.Namespaces {
-			includePatterns = append(includePatterns, fmt.Sprintf("/var/log/pods/%s_*/*/*.log", ns))
-		}
-	case "exclude":
-		includePatterns = []interface{}{"/var/log/pods/*/*/*.log"}
-		for _, ns := range logs.NamespaceSelector.Namespaces {
-			excludePatterns = append(excludePatterns, fmt.Sprintf("/var/log/pods/%s_*/*/*.log", ns))
-		}
-	default:
-		// No selector — collect from all namespaces
-		includePatterns = []interface{}{"/var/log/pods/*/*/*.log"}
-	}
-
-	filelogReceiver := map[string]interface{}{
-		"include":           includePatterns,
-		"include_file_path": true,
-		"operators": []interface{}{
-			map[string]interface{}{
-				"type": "container",
-				"id":   "container-parser",
-			},
-		},
-	}
-	if len(excludePatterns) > 0 {
-		filelogReceiver["exclude"] = excludePatterns
-	}
-
-	// Read credentials for the exporter
 	secret := &corev1.Secret{}
 	secretRef := config.Spec.Target.CredentialsSecret
 	if err := r.Get(ctx, client.ObjectKey{Name: secretRef.Name, Namespace: secretRef.Namespace}, secret); err != nil {
 		return nil, fmt.Errorf("failed to read credentials secret %s/%s: %w", secretRef.Namespace, secretRef.Name, err)
 	}
-
 	username := string(secret.Data["username"])
 	password := string(secret.Data["password"])
 	basicAuth := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", username, password)))
 	endpoint := strings.TrimRight(config.Spec.Target.Endpoint, "/")
+	tenantID := config.Spec.Target.GlobalTenantID
 
-	receivers := map[string]interface{}{
-		"filelog": filelogReceiver,
-	}
+	receivers := map[string]interface{}{}
 	processors := map[string]interface{}{
 		"batch": map[string]interface{}{},
 		"k8sattributes": map[string]interface{}{
@@ -577,131 +582,94 @@ func (r *ParseableConfigReconciler) buildLogCollectorConfig(ctx context.Context,
 			},
 		},
 	}
-	tenantID := config.Spec.Target.GlobalTenantID
-	exporters := map[string]interface{}{
-		"otlphttp/logs": map[string]interface{}{
+	exporters := map[string]interface{}{}
+	pipelines := map[string]interface{}{}
+
+	// Pod logs — built-in pipeline tailing /var/log/pods with the CRI container parser.
+	if config.Spec.Logs != nil &&
+		config.Spec.Logs.PodLogs != nil &&
+		config.Spec.Logs.PodLogs.Enabled &&
+		config.Spec.Logs.PodLogs.TargetDataset != "" {
+
+		pl := config.Spec.Logs.PodLogs
+
+		var includePatterns, excludePatterns []interface{}
+		switch pl.NamespaceSelector.Mode {
+		case "include":
+			for _, ns := range pl.NamespaceSelector.Namespaces {
+				includePatterns = append(includePatterns, fmt.Sprintf("/var/log/pods/%s_*/*/*.log", ns))
+			}
+		case "exclude":
+			includePatterns = []interface{}{"/var/log/pods/*/*/*.log"}
+			for _, ns := range pl.NamespaceSelector.Namespaces {
+				excludePatterns = append(excludePatterns, fmt.Sprintf("/var/log/pods/%s_*/*/*.log", ns))
+			}
+		default:
+			includePatterns = []interface{}{"/var/log/pods/*/*/*.log"}
+		}
+
+		filelogReceiver := map[string]interface{}{
+			"include":           includePatterns,
+			"include_file_path": true,
+			"operators": []interface{}{
+				map[string]interface{}{
+					"type": "container",
+					"id":   "container-parser",
+				},
+			},
+		}
+		if len(excludePatterns) > 0 {
+			filelogReceiver["exclude"] = excludePatterns
+		}
+
+		receivers["filelog/pod-logs"] = filelogReceiver
+		exporters["otlphttp/logs_pod-logs"] = map[string]interface{}{
 			"endpoint": endpoint,
-			"headers":  r.buildExporterHeaders(basicAuth, "otel-logs", logs.TargetDataset, tenantID, config.Spec.Target.Headers, logs.Headers),
-		},
-	}
-	pipelines := map[string]interface{}{
-		"logs": map[string]interface{}{
-			"receivers":  []interface{}{"filelog"},
+			"headers":  r.buildExporterHeaders(basicAuth, "otel-logs", pl.TargetDataset, tenantID, config.Spec.Target.Headers, pl.Headers),
+		}
+		pipelines["logs/pod-logs"] = map[string]interface{}{
+			"receivers":  []interface{}{"filelog/pod-logs"},
 			"processors": []interface{}{"k8sattributes", "batch"},
-			"exporters":  []interface{}{"otlphttp/logs"},
-		},
+			"exporters":  []interface{}{"otlphttp/logs_pod-logs"},
+		}
 	}
 
-	// Add kubeletstats metrics pipelines — split into node metrics and pod metrics on separate streams.
-	if config.Spec.Metrics != nil {
-		kubeletstatsAdded := false
-		addKubeletstats := func() {
-			if !kubeletstatsAdded {
-				receivers["kubeletstats"] = map[string]interface{}{
-					"collection_interval":  "30s",
-					"auth_type":            "serviceAccount",
-					"endpoint":             "https://${env:K8S_NODE_NAME}:10250",
-					"insecure_skip_verify": true,
-				}
-				kubeletstatsAdded = true
+	// File pipelines — one per Files[] entry. Tail every *.log under HostPath recursively, no parser.
+	if config.Spec.Logs != nil {
+		for _, f := range config.Spec.Logs.Files {
+			id := sanitizeName(f.Name)
+			if id == "" || f.HostPath == "" || f.TargetDataset == "" {
+				continue
 			}
-		}
+			base := strings.TrimRight(f.HostPath, "/")
 
-		// Node metrics pipeline → separate stream
-		if config.Spec.Metrics.NodeMetrics != nil && config.Spec.Metrics.NodeMetrics.TargetDataset != "" {
-			addKubeletstats()
-			exporters["otlphttp/nodemetrics"] = map[string]interface{}{
-				"endpoint": endpoint,
-				"headers":  r.buildExporterHeaders(basicAuth, "otel-metrics", config.Spec.Metrics.NodeMetrics.TargetDataset, tenantID, config.Spec.Target.Headers, config.Spec.Metrics.NodeMetrics.Headers),
-			}
-			// filter/node_only — keep only k8s.node.* metrics
-			processors["filter/node_only"] = map[string]interface{}{
-				"error_mode": "ignore",
-				"metrics": map[string]interface{}{
-					"metric": []interface{}{
-						`not IsMatch(name, "^k8s\\.node\\.")`,
-					},
+			receivers["filelog/"+id] = map[string]interface{}{
+				"include": []interface{}{
+					fmt.Sprintf("%s/*", base),
+					fmt.Sprintf("%s/**/*", base),
 				},
+				"include_file_path": true,
 			}
-			pipelines["metrics/node"] = map[string]interface{}{
-				"receivers":  []interface{}{"kubeletstats"},
-				"processors": []interface{}{"filter/node_only", "batch"},
-				"exporters":  []interface{}{"otlphttp/nodemetrics"},
-			}
-		}
-
-		// Pod metrics pipeline → separate stream, namespace-filtered
-		if config.Spec.Metrics.PodMetrics != nil && config.Spec.Metrics.PodMetrics.TargetDataset != "" {
-			addKubeletstats()
-			exporters["otlphttp/podmetrics"] = map[string]interface{}{
+			exporters["otlphttp/logs_"+id] = map[string]interface{}{
 				"endpoint": endpoint,
-				"headers":  r.buildExporterHeaders(basicAuth, "otel-metrics", config.Spec.Metrics.PodMetrics.TargetDataset, tenantID, config.Spec.Target.Headers, config.Spec.Metrics.PodMetrics.Headers),
+				"headers":  r.buildExporterHeaders(basicAuth, "otel-logs", f.TargetDataset, tenantID, config.Spec.Target.Headers, f.Headers),
 			}
-			// filter/pod_only — drop k8s.node.* metrics, keep pod/container metrics
-			processors["filter/pod_only"] = map[string]interface{}{
-				"error_mode": "ignore",
-				"metrics": map[string]interface{}{
-					"metric": []interface{}{
-						`IsMatch(name, "^k8s\\.node\\.")`,
-					},
-				},
-			}
-			podProcessors := []interface{}{"filter/pod_only"}
-
-			// filter/pod_ns — filter pod metrics to configured namespaces
-			podNs := config.Spec.Metrics.PodMetrics.NamespaceSelector
-			if len(podNs.Namespaces) > 0 {
-				switch podNs.Mode {
-				case "include":
-					// Drop metrics NOT in the allowed namespaces
-					parts := make([]string, 0, len(podNs.Namespaces))
-					for _, ns := range podNs.Namespaces {
-						parts = append(parts, fmt.Sprintf(`resource.attributes["k8s.namespace.name"] != "%s"`, ns))
-					}
-					processors["filter/pod_ns"] = map[string]interface{}{
-						"error_mode": "ignore",
-						"metrics": map[string]interface{}{
-							"metric": []interface{}{
-								strings.Join(parts, " and "),
-							},
-						},
-					}
-					podProcessors = append(podProcessors, "filter/pod_ns")
-				case "exclude":
-					// Drop metrics IN the excluded namespaces
-					var conditions []interface{}
-					for _, ns := range podNs.Namespaces {
-						conditions = append(conditions, fmt.Sprintf(`resource.attributes["k8s.namespace.name"] == "%s"`, ns))
-					}
-					processors["filter/pod_ns"] = map[string]interface{}{
-						"error_mode": "ignore",
-						"metrics": map[string]interface{}{
-							"metric": conditions,
-						},
-					}
-					podProcessors = append(podProcessors, "filter/pod_ns")
-				}
-			}
-
-			podProcessors = append(podProcessors, "batch")
-			pipelines["metrics/pod"] = map[string]interface{}{
-				"receivers":  []interface{}{"kubeletstats"},
-				"processors": podProcessors,
-				"exporters":  []interface{}{"otlphttp/podmetrics"},
+			pipelines["logs/"+id] = map[string]interface{}{
+				"receivers":  []interface{}{"filelog/" + id},
+				"processors": []interface{}{"batch"},
+				"exporters":  []interface{}{"otlphttp/logs_" + id},
 			}
 		}
 	}
 
-	collectorConfig := map[string]interface{}{
+	return map[string]interface{}{
 		"receivers":  receivers,
 		"processors": processors,
 		"exporters":  exporters,
 		"service": map[string]interface{}{
 			"pipelines": pipelines,
 		},
-	}
-
-	return collectorConfig, nil
+	}, nil
 }
 
 // ensureMetricsEventsCollector creates or updates a single Deployment-mode OpenTelemetryCollector CR
@@ -720,7 +688,18 @@ func (r *ParseableConfigReconciler) ensureMetricsEventsCollector(ctx context.Con
 	existing.SetGroupVersionKind(gvk)
 	err := r.Get(ctx, client.ObjectKey{Name: metricsEventsCollectorName, Namespace: config.Namespace}, existing)
 
-	metricsEnabled := config.Spec.Metrics != nil && config.Spec.Metrics.PodMetrics != nil && config.Spec.Metrics.PodMetrics.TargetDataset != ""
+	metricsEnabled := false
+	if config.Spec.Metrics != nil {
+		if anyClusterMetricEnabled(config.Spec.Metrics.ClusterMetrics) {
+			metricsEnabled = true
+		}
+		for _, sc := range config.Spec.Metrics.ScrapeConfigs {
+			if sc.Name != "" && sc.TargetDataset != "" && sc.Port > 0 {
+				metricsEnabled = true
+				break
+			}
+		}
+	}
 	eventsEnabled := config.Spec.Events != nil && config.Spec.Events.Enabled && config.Spec.Events.TargetDataset != ""
 
 	if !metricsEnabled && !eventsEnabled {
@@ -741,6 +720,11 @@ func (r *ParseableConfigReconciler) ensureMetricsEventsCollector(ctx context.Con
 	spec := map[string]interface{}{
 		"mode":   "deployment",
 		"config": collectorConfig,
+		// Tolerate every taint so the metrics+events Deployment can land on any node —
+		// k8sobjects/k8s_cluster only need API access, not specific nodepool placement.
+		"tolerations": []interface{}{
+			map[string]interface{}{"operator": "Exists"},
+		},
 	}
 
 	if err == nil {
@@ -777,18 +761,17 @@ func (r *ParseableConfigReconciler) ensureMetricsEventsCollector(ctx context.Con
 	return nil
 }
 
-// buildMetricsEventsCollectorConfig builds a single OTel collector config with:
-//   - metrics pipeline: k8s_cluster → filter → batch → otlphttp/metrics
-//   - logs pipeline (events): k8sobjects → filter → batch → otlphttp/events
-//
-// Each pipeline has its own exporter with the correct stream/headers for Parseable.
+// buildMetricsEventsCollectorConfig builds a single Deployment-mode collector config that hosts:
+//   - one pipeline using the k8s_cluster receiver (cluster-level object state) when ClusterMetrics is enabled;
+//   - one pipeline per ScrapeConfigs[] entry using the prometheus receiver with Kubernetes service discovery;
+//   - one pipeline using the k8sobjects receiver when Events is enabled.
 func (r *ParseableConfigReconciler) buildMetricsEventsCollectorConfig(
 	ctx context.Context,
 	config *observabilityv1alpha1.ParseableConfig,
 	metricsEnabled, eventsEnabled bool,
 ) (map[string]interface{}, error) {
+	_ = metricsEnabled // gating is per-section below
 
-	// Read credentials (shared by both pipelines)
 	secret := &corev1.Secret{}
 	secretRef := config.Spec.Target.CredentialsSecret
 	if err := r.Get(ctx, client.ObjectKey{Name: secretRef.Name, Namespace: secretRef.Namespace}, secret); err != nil {
@@ -808,48 +791,195 @@ func (r *ParseableConfigReconciler) buildMetricsEventsCollectorConfig(
 	exporters := map[string]interface{}{}
 	pipelines := map[string]interface{}{}
 
-	// --- Metrics pipeline (k8s_cluster receiver → podMetrics stream) ---
-	if metricsEnabled {
-		podMetrics := config.Spec.Metrics.PodMetrics
+	// Cluster metrics — up to three receivers (k8s_cluster, kubelet /metrics, kube-state-metrics)
+	// feed a single shared exporter at ClusterMetrics.TargetDataset.
+	if config.Spec.Metrics != nil && anyClusterMetricEnabled(config.Spec.Metrics.ClusterMetrics) {
+		cm := config.Spec.Metrics.ClusterMetrics
 
-		k8sClusterCfg := map[string]interface{}{
-			"collection_interval": "30s",
-		}
-		// Use the receiver's native namespaces field to filter at source (include mode only)
-		if len(podMetrics.NamespaceSelector.Namespaces) > 0 && podMetrics.NamespaceSelector.Mode == "include" {
-			k8sClusterCfg["namespaces"] = toInterfaceSlice(podMetrics.NamespaceSelector.Namespaces)
-		}
-		receivers["k8s_cluster"] = k8sClusterCfg
+		var clusterReceivers []interface{}
 
-		metricsProcessorList := []interface{}{}
-
-		// Filter processor using OTTL metric context — drops metrics not in allowed namespaces
-		if len(podMetrics.NamespaceSelector.Namespaces) > 0 && podMetrics.NamespaceSelector.Mode == "include" {
-			parts := make([]string, 0, len(podMetrics.NamespaceSelector.Namespaces))
-			for _, ns := range podMetrics.NamespaceSelector.Namespaces {
-				parts = append(parts, fmt.Sprintf(`resource.attributes["k8s.namespace.name"] != "%s"`, ns))
+		if cm.K8sCluster != nil && cm.K8sCluster.Enabled {
+			k8sClusterCfg := map[string]interface{}{
+				"collection_interval": "30s",
+				"auth_type":           "serviceAccount",
 			}
-			condition := strings.Join(parts, " and ")
-			processors["filter/metrics_ns"] = map[string]interface{}{
-				"error_mode": "ignore",
-				"metrics": map[string]interface{}{
-					"metric": []interface{}{condition},
+			if len(cm.K8sCluster.NodeConditions) > 0 {
+				k8sClusterCfg["node_conditions_to_report"] = toInterfaceSlice(cm.K8sCluster.NodeConditions)
+			}
+			if len(cm.K8sCluster.AllocatableResources) > 0 {
+				k8sClusterCfg["allocatable_types_to_report"] = toInterfaceSlice(cm.K8sCluster.AllocatableResources)
+			}
+			if len(cm.NamespaceSelector.Namespaces) > 0 && cm.NamespaceSelector.Mode == "include" {
+				k8sClusterCfg["namespaces"] = toInterfaceSlice(cm.NamespaceSelector.Namespaces)
+			}
+			receivers["k8s_cluster"] = k8sClusterCfg
+			clusterReceivers = append(clusterReceivers, "k8s_cluster")
+		}
+
+		if cm.Kubelet != nil && cm.Kubelet.Enabled {
+			receivers["prometheus/kubelet"] = map[string]interface{}{
+				"config": map[string]interface{}{
+					"scrape_configs": []interface{}{
+						map[string]interface{}{
+							"job_name":          "kubelet",
+							"scrape_interval":   "30s",
+							"scheme":            "https",
+							"bearer_token_file": "/var/run/secrets/kubernetes.io/serviceaccount/token",
+							"tls_config": map[string]interface{}{
+								"ca_file":              "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
+								"insecure_skip_verify": true,
+							},
+							"kubernetes_sd_configs": []interface{}{
+								map[string]interface{}{"role": "node"},
+							},
+							"relabel_configs": []interface{}{
+								map[string]interface{}{
+									"target_label": "__metrics_path__",
+									"replacement":  "/metrics",
+								},
+								map[string]interface{}{
+									"source_labels": []interface{}{"__meta_kubernetes_node_name"},
+									"target_label":  "node",
+								},
+							},
+						},
+					},
 				},
 			}
-			metricsProcessorList = append(metricsProcessorList, "filter/metrics_ns")
+			clusterReceivers = append(clusterReceivers, "prometheus/kubelet")
 		}
 
-		metricsProcessorList = append(metricsProcessorList, "batch")
+		if cm.KubeState != nil && cm.KubeState.Enabled {
+			ksNamespaces := cm.KubeState.Namespaces
+			if len(ksNamespaces) == 0 {
+				ksNamespaces = []string{"kube-system", "kube-state-metrics", "default"}
+			}
+			receivers["prometheus/kube-state-metrics"] = map[string]interface{}{
+				"config": map[string]interface{}{
+					"scrape_configs": []interface{}{
+						map[string]interface{}{
+							"job_name":        "kube-state-metrics",
+							"scrape_interval": "30s",
+							"kubernetes_sd_configs": []interface{}{
+								map[string]interface{}{
+									"role": "service",
+									"namespaces": map[string]interface{}{
+										"names": toInterfaceSlice(ksNamespaces),
+									},
+								},
+							},
+							"relabel_configs": []interface{}{
+								map[string]interface{}{
+									"source_labels": []interface{}{"__meta_kubernetes_service_name"},
+									"regex":         ".*kube-state-metrics.*",
+									"action":        "keep",
+								},
+								map[string]interface{}{
+									"source_labels": []interface{}{"__meta_kubernetes_service_port_name"},
+									"regex":         "metrics|http-metrics",
+									"action":        "keep",
+								},
+							},
+						},
+					},
+				},
+			}
+			clusterReceivers = append(clusterReceivers, "prometheus/kube-state-metrics")
+		}
 
-		exporters["otlphttp/metrics"] = map[string]interface{}{
+		exporters["otlphttp/clustermetrics"] = map[string]interface{}{
 			"endpoint": endpoint,
-			"headers":  r.buildExporterHeaders(basicAuth, "otel-metrics", podMetrics.TargetDataset, tenantID, config.Spec.Target.Headers, podMetrics.Headers),
+			"headers":  r.buildExporterHeaders(basicAuth, "otel-metrics", cm.TargetDataset, tenantID, config.Spec.Target.Headers, cm.Headers),
 		}
+		pipelines["metrics/cluster"] = map[string]interface{}{
+			"receivers":  clusterReceivers,
+			"processors": []interface{}{"batch"},
+			"exporters":  []interface{}{"otlphttp/clustermetrics"},
+		}
+	}
 
-		pipelines["metrics"] = map[string]interface{}{
-			"receivers":  []interface{}{"k8s_cluster"},
-			"processors": metricsProcessorList,
-			"exporters":  []interface{}{"otlphttp/metrics"},
+	// Per-scrape-entry Prometheus pipelines with Kubernetes pod service discovery.
+	if config.Spec.Metrics != nil {
+		for _, sc := range config.Spec.Metrics.ScrapeConfigs {
+			id := sanitizeName(sc.Name)
+			if id == "" || sc.TargetDataset == "" || sc.Port <= 0 {
+				continue
+			}
+			metricsPath := sc.URI
+			if metricsPath == "" {
+				metricsPath = "/metrics"
+			}
+			if !strings.HasPrefix(metricsPath, "/") {
+				metricsPath = "/" + metricsPath
+			}
+
+			sdConfig := map[string]interface{}{
+				"role": "pod",
+			}
+			if len(sc.NamespaceSelector.Namespaces) > 0 && sc.NamespaceSelector.Mode == "include" {
+				sdConfig["namespaces"] = map[string]interface{}{
+					"names": toInterfaceSlice(sc.NamespaceSelector.Namespaces),
+				}
+			}
+
+			var relabelConfigs []interface{}
+			if len(sc.PodSelector) > 0 {
+				// Label-based filter: one keep relabel per label key/value.
+				for k, v := range sc.PodSelector {
+					relabelConfigs = append(relabelConfigs, map[string]interface{}{
+						"source_labels": []interface{}{"__meta_kubernetes_pod_label_" + sanitizePromLabel(k)},
+						"action":        "keep",
+						"regex":         v,
+					})
+				}
+			} else {
+				// Port-based filter: keep only pods whose container exposes the configured port.
+				relabelConfigs = append(relabelConfigs, map[string]interface{}{
+					"source_labels": []interface{}{"__meta_kubernetes_pod_container_port_number"},
+					"action":        "keep",
+					"regex":         fmt.Sprintf("%d", sc.Port),
+				})
+			}
+			relabelConfigs = append(relabelConfigs, map[string]interface{}{
+				"source_labels": []interface{}{"__meta_kubernetes_pod_ip"},
+				"action":        "replace",
+				"target_label":  "__address__",
+				// $$1 → $1 after OTel confmap escape, then Prometheus expands to the captured pod IP.
+				"replacement": fmt.Sprintf("$$1:%d", sc.Port),
+			})
+			if len(sc.NamespaceSelector.Namespaces) > 0 && sc.NamespaceSelector.Mode == "exclude" {
+				regex := strings.Join(sc.NamespaceSelector.Namespaces, "|")
+				relabelConfigs = append([]interface{}{
+					map[string]interface{}{
+						"source_labels": []interface{}{"__meta_kubernetes_namespace"},
+						"action":        "drop",
+						"regex":         regex,
+					},
+				}, relabelConfigs...)
+			}
+
+			receivers["prometheus/"+id] = map[string]interface{}{
+				"config": map[string]interface{}{
+					"scrape_configs": []interface{}{
+						map[string]interface{}{
+							"job_name":              id,
+							"scrape_interval":       "30s",
+							"metrics_path":          metricsPath,
+							"kubernetes_sd_configs": []interface{}{sdConfig},
+							"relabel_configs":       relabelConfigs,
+						},
+					},
+				},
+			}
+			exporters["otlphttp/metrics_"+id] = map[string]interface{}{
+				"endpoint": endpoint,
+				"headers":  r.buildExporterHeaders(basicAuth, "otel-metrics", sc.TargetDataset, tenantID, config.Spec.Target.Headers, sc.Headers),
+			}
+			pipelines["metrics/"+id] = map[string]interface{}{
+				"receivers":  []interface{}{"prometheus/" + id},
+				"processors": []interface{}{"batch"},
+				"exporters":  []interface{}{"otlphttp/metrics_" + id},
+			}
 		}
 	}
 
@@ -917,6 +1047,59 @@ func toInterfaceSlice(ss []string) []interface{} {
 	out := make([]interface{}, len(ss))
 	for i, s := range ss {
 		out[i] = s
+	}
+	return out
+}
+
+// sanitizePromLabel converts a Kubernetes label key into the Prometheus relabel form
+// (alphanumeric + underscore). Mirrors Prometheus' own label-name sanitization rules.
+func sanitizePromLabel(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9'):
+			b.WriteRune(r)
+		default:
+			b.WriteRune('_')
+		}
+	}
+	return b.String()
+}
+
+// anyClusterMetricEnabled reports whether at least one built-in cluster-metrics
+// receiver is enabled with a target dataset to ship to.
+func anyClusterMetricEnabled(cm *observabilityv1alpha1.ClusterMetricsConfig) bool {
+	if cm == nil || cm.TargetDataset == "" {
+		return false
+	}
+	if cm.K8sCluster != nil && cm.K8sCluster.Enabled {
+		return true
+	}
+	if cm.Kubelet != nil && cm.Kubelet.Enabled {
+		return true
+	}
+	if cm.KubeState != nil && cm.KubeState.Enabled {
+		return true
+	}
+	return false
+}
+
+// sanitizeName returns a DNS-1123 compliant lowercase identifier derived from s.
+// Used for volume names and OTel pipeline/receiver/exporter IDs.
+func sanitizeName(s string) string {
+	var b strings.Builder
+	s = strings.ToLower(s)
+	for _, r := range s {
+		switch {
+		case (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9'):
+			b.WriteRune(r)
+		case r == '-' || r == '_' || r == ' ' || r == '/' || r == '.':
+			b.WriteRune('-')
+		}
+	}
+	out := strings.Trim(b.String(), "-")
+	for strings.Contains(out, "--") {
+		out = strings.ReplaceAll(out, "--", "-")
 	}
 	return out
 }
