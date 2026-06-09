@@ -344,7 +344,7 @@ func (r *ParseableConfigReconciler) buildInstrumentationSpec(ctx context.Context
 		"env": []interface{}{
 			map[string]interface{}{
 				"name":  "OTEL_EXPORTER_OTLP_PROTOCOL",
-				"value": "http/protobuf",
+				"value": resolveOtlpProtocol(config.Spec.Target.Encoding),
 			},
 			map[string]interface{}{
 				"name":  "OTEL_EXPORTER_OTLP_HEADERS",
@@ -566,6 +566,7 @@ func (r *ParseableConfigReconciler) buildLogCollectorConfig(ctx context.Context,
 	password := string(secret.Data["password"])
 	basicAuth := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", username, password)))
 	endpoint := strings.TrimRight(config.Spec.Target.Endpoint, "/")
+	encoding := resolveOtlpEncoding(config.Spec.Target.Encoding)
 	tenantID := config.Spec.Target.GlobalTenantID
 
 	receivers := map[string]interface{}{}
@@ -625,6 +626,7 @@ func (r *ParseableConfigReconciler) buildLogCollectorConfig(ctx context.Context,
 		receivers["filelog/pod-logs"] = filelogReceiver
 		exporters["otlphttp/logs_pod-logs"] = map[string]interface{}{
 			"endpoint": endpoint,
+			"encoding": encoding,
 			"headers":  r.buildExporterHeaders(basicAuth, "otel-logs", pl.TargetDataset, tenantID, config.Spec.Target.Headers, pl.Headers),
 		}
 		pipelines["logs/pod-logs"] = map[string]interface{}{
@@ -652,6 +654,7 @@ func (r *ParseableConfigReconciler) buildLogCollectorConfig(ctx context.Context,
 			}
 			exporters["otlphttp/logs_"+id] = map[string]interface{}{
 				"endpoint": endpoint,
+				"encoding": encoding,
 				"headers":  r.buildExporterHeaders(basicAuth, "otel-logs", f.TargetDataset, tenantID, config.Spec.Target.Headers, f.Headers),
 			}
 			pipelines["logs/"+id] = map[string]interface{}{
@@ -782,6 +785,7 @@ func (r *ParseableConfigReconciler) buildMetricsEventsCollectorConfig(
 	password := string(secret.Data["password"])
 	basicAuth := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", username, password)))
 	endpoint := strings.TrimRight(config.Spec.Target.Endpoint, "/")
+	encoding := resolveOtlpEncoding(config.Spec.Target.Encoding)
 	tenantID := config.Spec.Target.GlobalTenantID
 
 	receivers := map[string]interface{}{}
@@ -889,6 +893,7 @@ func (r *ParseableConfigReconciler) buildMetricsEventsCollectorConfig(
 
 		exporters["otlphttp/clustermetrics"] = map[string]interface{}{
 			"endpoint": endpoint,
+			"encoding": encoding,
 			"headers":  r.buildExporterHeaders(basicAuth, "otel-metrics", cm.TargetDataset, tenantID, config.Spec.Target.Headers, cm.Headers),
 		}
 		pipelines["metrics/cluster"] = map[string]interface{}{
@@ -973,6 +978,7 @@ func (r *ParseableConfigReconciler) buildMetricsEventsCollectorConfig(
 			}
 			exporters["otlphttp/metrics_"+id] = map[string]interface{}{
 				"endpoint": endpoint,
+				"encoding": encoding,
 				"headers":  r.buildExporterHeaders(basicAuth, "otel-metrics", sc.TargetDataset, tenantID, config.Spec.Target.Headers, sc.Headers),
 			}
 			pipelines["metrics/"+id] = map[string]interface{}{
@@ -1020,6 +1026,7 @@ func (r *ParseableConfigReconciler) buildMetricsEventsCollectorConfig(
 
 		exporters["otlphttp/events"] = map[string]interface{}{
 			"endpoint": endpoint,
+			"encoding": encoding,
 			"headers":  r.buildExporterHeaders(basicAuth, "otel-logs", events.TargetDataset, tenantID, config.Spec.Target.Headers, events.Headers),
 		}
 
@@ -1049,6 +1056,25 @@ func toInterfaceSlice(ss []string) []interface{} {
 		out[i] = s
 	}
 	return out
+}
+
+// resolveOtlpEncoding returns the otlphttp exporter `encoding` value for the
+// configured target encoding. Defaults to "json" (Parseable's universally
+// supported wire format); "proto" is honored when explicitly set.
+func resolveOtlpEncoding(target string) string {
+	if target == "proto" {
+		return "proto"
+	}
+	return "json"
+}
+
+// resolveOtlpProtocol returns the OTEL_EXPORTER_OTLP_PROTOCOL env-var value
+// for SDK instrumentation, matching the target encoding.
+func resolveOtlpProtocol(target string) string {
+	if target == "proto" {
+		return "http/protobuf"
+	}
+	return "http/json"
 }
 
 // sanitizePromLabel converts a Kubernetes label key into the Prometheus relabel form

@@ -52,6 +52,11 @@ type TargetConfig struct {
 
 	// Headers are additional HTTP headers applied to all signal exporters. Signal-level headers override these.
 	Headers map[string]string `json:"headers,omitempty"`
+
+	// Encoding controls the OTLP HTTP wire format. "json" (default) is universally supported by Parseable;
+	// "proto" is more efficient but not every Parseable cluster supports it.
+	// +kubebuilder:validation:Enum=json;proto
+	Encoding string `json:"encoding,omitempty"`
 }
 
 // InstrumentationConfig defines auto-instrumentation settings

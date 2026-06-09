@@ -329,6 +329,14 @@ spec:
                     - name
                     - namespace
                     type: object
+                  encoding:
+                    description: |-
+                      Encoding controls the OTLP HTTP wire format. "json" (default) is universally supported by Parseable;
+                      "proto" is more efficient but not every Parseable cluster supports it.
+                    enum:
+                    - json
+                    - proto
+                    type: string
                   endpoint:
                     description: Endpoint is the Parseable API endpoint URL for ingestion
                     type: string
