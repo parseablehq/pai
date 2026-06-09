@@ -22,6 +22,7 @@ metadata:
 spec:
   target:
     endpoint: <AZURE_STAGING_PARSEABLE_ENDPOINT>
+    encoding: json
     credentialsSecret:
       name: parseable-creds
       namespace: parseable-operator-system
