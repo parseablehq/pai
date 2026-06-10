@@ -231,7 +231,8 @@ func (r *ParseableConfigReconciler) ensureCollectorRBAC(ctx context.Context, nam
 		Rules: []rbacv1.PolicyRule{
 			{
 				APIGroups: []string{""},
-				Resources: []string{"events", "namespaces", "namespaces/status", "nodes", "nodes/spec", "nodes/stats", "nodes/proxy",
+				Resources: []string{"events", "namespaces", "namespaces/status",
+					"nodes", "nodes/spec", "nodes/stats", "nodes/proxy", "nodes/metrics",
 					"pods", "pods/status", "replicationcontrollers", "replicationcontrollers/status",
 					"resourcequotas", "services"},
 				Verbs: []string{"get", "list", "watch"},
