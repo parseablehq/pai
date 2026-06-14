@@ -1,0 +1,74 @@
+# ParseableConfig for the Azure staging cluster.
+#
+# Before applying:
+#   1. Replace <AZURE_STAGING_PARSEABLE_ENDPOINT> with the real ingest URL.
+#   2. Create the parseable-creds secret in parseable-operator-system:
+#        kubectl create secret generic parseable-creds \
+#          -n parseable-operator-system \
+#          --from-literal=username=<user> \
+#          --from-literal=password=<pass>
+#   3. Make sure the parseable-operator-system namespace exists, then:
+#        kubectl apply -f azure-staging.yaml
+#
+# Collects:
+#   - all Kubernetes pod logs (cluster-wide) → dataset azure-staging-pod-logs
+#   - parseable audit logs from the host → dataset azure-staging-parseable-audit
+#   - parseable server logs from the host → dataset azure-staging-parseable-server
+apiVersion: observability.parseable.com/v1alpha1
+kind: ParseableConfig
+metadata:
+  name: azure-staging
+  namespace: parseable-operator-system
+spec:
+  target:
+    endpoint: <AZURE_STAGING_PARSEABLE_ENDPOINT>
+    encoding: json
+    credentialsSecret:
+      name: parseable-creds
+      namespace: parseable-operator-system
+
+  logs:
+    podLogs:
+      enabled: true
+      targetDataset: azure-staging-pod-logs
+
+    files:
+      - name: parseable audit logs
+        hostPath: /var/log/parseable/audit_logs
+        targetDataset: azure-staging-parseable-audit
+
+      - name: parseable server logs
+        hostPath: /var/log/parseable/server_logs
+        targetDataset: azure-staging-parseable-server
+
+  events:
+    enabled: true
+    targetDataset: azure-staging-events
+
+  metrics:
+    clusterMetrics:
+      targetDataset: azure-staging-cluster-metrics
+      k8sCluster:
+        enabled: true
+        nodeConditions:
+          - Ready
+          - DiskPressure
+          - MemoryPressure
+          - PIDPressure
+          - NetworkUnavailable
+        allocatableResources:
+          - cpu
+          - memory
+          - storage
+      kubelet:
+        enabled: true
+      kubeState:
+        enabled: true
+
+    scrapeConfigs:
+      - name: parseable metrics
+        targetDataset: azure-staging-parseable-metrics
+        uri: /v1/metrics
+        port: 8000
+        podSelector:
+          app: parseable-cluster

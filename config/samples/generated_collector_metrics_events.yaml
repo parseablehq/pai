@@ -1,17 +1,31 @@
-# This is the OpenTelemetryCollector CR that PAI generates when metrics and/or events are enabled.
-# PAI translates spec.metrics + spec.events into a single Deployment-mode collector with two pipelines.
+# This is the OpenTelemetryCollector CR that PAI generates for the metrics+events Deployment.
+# PAI translates spec.metrics + spec.events into one Deployment-mode collector with one pipeline
+# per ScrapeConfigs[] entry, one pipeline for cluster object state (when ClusterMetrics is enabled),
+# and one pipeline for Kubernetes events (when Events is enabled).
+#
+# Note: kubeletstats for pod+node resource metrics lives in the log DaemonSet instead, because each
+# kubelet only exposes its own node. Both kubeletstats and k8s_cluster ship to the same
+# ClusterMetrics.TargetDataset.
 #
 # Input (from ParseableConfig):
 #   metrics:
-#     stream: pai-metrics
-#     namespaceSelector:
-#       mode: include
-#       namespaces: [demo]
-#     nodeMetrics:
+#     clusterMetrics:
 #       enabled: true
+#       targetDataset: pai-cluster-metrics
+#       namespaceSelector:
+#         mode: include
+#         namespaces: [demo]
+#     scrapeConfigs:
+#       - name: app metrics
+#         uri: /metrics
+#         port: 8080
+#         targetDataset: pai-app-metrics
+#         namespaceSelector:
+#           mode: include
+#           namespaces: [demo]
 #   events:
 #     enabled: true
-#     stream: pai-events
+#     targetDataset: pai-events
 #     namespaceSelector:
 #       mode: include
 #       namespaces: [demo]
@@ -25,42 +39,56 @@ spec:
   mode: deployment
   config:
     receivers:
-      # Cluster-level metrics (deployments, pods, nodes, etc.)
+      # Cluster-level object state (deployments, pods, nodes, etc.)
       k8s_cluster:
         collection_interval: 30s
+        namespaces: [demo]
 
-      # Node-level metrics (CPU, memory, disk, network) — only if nodeMetrics.enabled
-      kubeletstats:
-        collection_interval: 30s
-        auth_type: serviceAccount
-        insecure_skip_verify: true
+      # One prometheus receiver per ScrapeConfigs[] entry, with Kubernetes pod SD.
+      prometheus/app-metrics:
+        config:
+          scrape_configs:
+            - job_name: app-metrics
+              scrape_interval: 30s
+              metrics_path: /metrics
+              kubernetes_sd_configs:
+                - role: pod
+                  namespaces:
+                    names: [demo]
+              relabel_configs:
+                - source_labels: [__meta_kubernetes_pod_container_port_number]
+                  action: keep
+                  regex: "8080"
+                - source_labels: [__meta_kubernetes_pod_ip]
+                  action: replace
+                  target_label: __address__
+                  replacement: "${1}:8080"
 
-      # Kubernetes events — only if events.enabled
+      # Kubernetes events
       k8sobjects:
         objects:
           - name: events
             mode: watch
-            namespaces: [demo]    # from events.namespaceSelector (include mode)
+            namespaces: [demo]
 
     processors:
-      # Namespace filter for metrics (OTTL syntax) — only if metrics.namespaceSelector is set
-      filter/metrics_ns:
-        error_mode: ignore
-        metrics:
-          datapoint:
-            - 'resource.attributes["k8s.namespace.name"] == nil or not IsMatch(resource.attributes["k8s.namespace.name"], "^(demo)$")'
       batch: {}
 
     exporters:
-      # Metrics exporter — sends to pai-metrics stream
-      otlphttp/metrics:
+      otlphttp/clustermetrics:
         endpoint: http://<YOUR_PARSEABLE_ENDPOINT>:8010
         headers:
           Authorization: "Basic <base64-encoded>"
           X-P-Log-Source: otel-metrics
-          X-P-Stream: pai-metrics
+          X-P-Stream: pai-cluster-metrics
 
-      # Events exporter — sends to pai-events stream
+      otlphttp/metrics_app-metrics:
+        endpoint: http://<YOUR_PARSEABLE_ENDPOINT>:8010
+        headers:
+          Authorization: "Basic <base64-encoded>"
+          X-P-Log-Source: otel-metrics
+          X-P-Stream: pai-app-metrics
+
       otlphttp/events:
         endpoint: http://<YOUR_PARSEABLE_ENDPOINT>:8010
         headers:
@@ -70,13 +98,16 @@ spec:
 
     service:
       pipelines:
-        # Metrics pipeline
-        metrics:
-          receivers: [k8s_cluster, kubeletstats]
-          processors: [filter/metrics_ns, batch]
-          exporters: [otlphttp/metrics]
+        metrics/cluster:
+          receivers: [k8s_cluster]
+          processors: [batch]
+          exporters: [otlphttp/clustermetrics]
 
-        # Events pipeline (events are logs in OTel)
+        metrics/app-metrics:
+          receivers: [prometheus/app-metrics]
+          processors: [batch]
+          exporters: [otlphttp/metrics_app-metrics]
+
         logs:
           receivers: [k8sobjects]
           processors: [batch]
