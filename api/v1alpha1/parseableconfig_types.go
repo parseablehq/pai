@@ -44,8 +44,16 @@ type TargetConfig struct {
 	// Endpoint is the Parseable API endpoint URL for ingestion
 	Endpoint string `json:"endpoint"`
 
-	// CredentialsSecret references the secret containing authentication credentials
+	// CredentialsSecret references the secret containing authentication credentials.
+	// For authType "basic" (default) the secret must carry "username" and "password" keys.
+	// For authType "apiKey" the secret must carry an "apiKey" key.
 	CredentialsSecret SecretReference `json:"credentialsSecret"`
+
+	// AuthType selects how the operator authenticates to Parseable.
+	// "basic" (default) sends an Authorization: Basic <base64(user:pass)> header.
+	// "apiKey" sends the credential in the x-api-key header.
+	// +kubebuilder:validation:Enum=basic;apiKey
+	AuthType string `json:"authType,omitempty"`
 
 	// GlobalTenantID is an optional tenant identifier. When set, the X-P-Tenant header is added to all collector exporters.
 	GlobalTenantID string `json:"globalTenantId,omitempty"`

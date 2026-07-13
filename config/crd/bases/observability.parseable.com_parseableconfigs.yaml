@@ -315,9 +315,20 @@ spec:
               target:
                 description: Target defines the global Parseable endpoint and credentials
                 properties:
+                  authType:
+                    description: |-
+                      AuthType selects how the operator authenticates to Parseable.
+                      "basic" (default) sends an Authorization: Basic <base64(user:pass)> header.
+                      "apiKey" sends the credential in the x-api-key header.
+                    enum:
+                    - basic
+                    - apiKey
+                    type: string
                   credentialsSecret:
-                    description: CredentialsSecret references the secret containing
-                      authentication credentials
+                    description: |-
+                      CredentialsSecret references the secret containing authentication credentials.
+                      For authType "basic" (default) the secret must carry "username" and "password" keys.
+                      For authType "apiKey" the secret must carry an "apiKey" key.
                     properties:
                       name:
                         description: Name is the name of the secret

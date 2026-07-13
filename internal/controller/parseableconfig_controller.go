@@ -320,16 +320,10 @@ func (r *ParseableConfigReconciler) ensureCollectorRBAC(ctx context.Context, nam
 
 // buildInstrumentationSpec builds the Instrumentation spec that sends traces directly to Parseable
 func (r *ParseableConfigReconciler) buildInstrumentationSpec(ctx context.Context, config *observabilityv1alpha1.ParseableConfig) (map[string]interface{}, error) {
-	// Read credentials secret
-	secret := &corev1.Secret{}
-	secretRef := config.Spec.Target.CredentialsSecret
-	if err := r.Get(ctx, client.ObjectKey{Name: secretRef.Name, Namespace: secretRef.Namespace}, secret); err != nil {
-		return nil, fmt.Errorf("failed to read credentials secret %s/%s: %w", secretRef.Namespace, secretRef.Name, err)
+	authKey, authValue, err := r.resolveAuthHeader(ctx, config.Spec.Target)
+	if err != nil {
+		return nil, err
 	}
-
-	username := string(secret.Data["username"])
-	password := string(secret.Data["password"])
-	basicAuth := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", username, password)))
 
 	tracesStream := config.Spec.Traces.TargetDataset
 	endpoint := strings.TrimRight(config.Spec.Target.Endpoint, "/")
@@ -349,7 +343,7 @@ func (r *ParseableConfigReconciler) buildInstrumentationSpec(ctx context.Context
 			},
 			map[string]interface{}{
 				"name":  "OTEL_EXPORTER_OTLP_HEADERS",
-				"value": r.buildOtlpHeaders(basicAuth, "otel-traces", tracesStream, config.Spec.Target.GlobalTenantID, config.Spec.Target.Headers, config.Spec.Traces.Headers),
+				"value": r.buildOtlpHeaders(authKey, authValue, "otel-traces", tracesStream, config.Spec.Target.GlobalTenantID, config.Spec.Target.Headers, config.Spec.Traces.Headers),
 			},
 		},
 	}
@@ -578,14 +572,10 @@ func (r *ParseableConfigReconciler) ensureLogCollector(ctx context.Context, conf
 // Each Logs[] entry becomes its own filelog receiver + exporter pair. If ClusterMetrics is enabled,
 // a single kubeletstats receiver feeds pod+node resource metrics into the same target dataset.
 func (r *ParseableConfigReconciler) buildLogCollectorConfig(ctx context.Context, config *observabilityv1alpha1.ParseableConfig) (map[string]interface{}, error) {
-	secret := &corev1.Secret{}
-	secretRef := config.Spec.Target.CredentialsSecret
-	if err := r.Get(ctx, client.ObjectKey{Name: secretRef.Name, Namespace: secretRef.Namespace}, secret); err != nil {
-		return nil, fmt.Errorf("failed to read credentials secret %s/%s: %w", secretRef.Namespace, secretRef.Name, err)
+	authKey, authValue, err := r.resolveAuthHeader(ctx, config.Spec.Target)
+	if err != nil {
+		return nil, err
 	}
-	username := string(secret.Data["username"])
-	password := string(secret.Data["password"])
-	basicAuth := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", username, password)))
 	endpoint := strings.TrimRight(config.Spec.Target.Endpoint, "/")
 	encoding := resolveOtlpEncoding(config.Spec.Target.Encoding)
 	tenantID := config.Spec.Target.GlobalTenantID
@@ -648,7 +638,7 @@ func (r *ParseableConfigReconciler) buildLogCollectorConfig(ctx context.Context,
 		exporters["otlphttp/logs_pod-logs"] = map[string]interface{}{
 			"endpoint": endpoint,
 			"encoding": encoding,
-			"headers":  r.buildExporterHeaders(basicAuth, "otel-logs", pl.TargetDataset, tenantID, config.Spec.Target.Headers, pl.Headers),
+			"headers":  r.buildExporterHeaders(authKey, authValue, "otel-logs", pl.TargetDataset, tenantID, config.Spec.Target.Headers, pl.Headers),
 		}
 		pipelines["logs/pod-logs"] = map[string]interface{}{
 			"receivers":  []interface{}{"filelog/pod-logs"},
@@ -676,7 +666,7 @@ func (r *ParseableConfigReconciler) buildLogCollectorConfig(ctx context.Context,
 			exporters["otlphttp/logs_"+id] = map[string]interface{}{
 				"endpoint": endpoint,
 				"encoding": encoding,
-				"headers":  r.buildExporterHeaders(basicAuth, "otel-logs", f.TargetDataset, tenantID, config.Spec.Target.Headers, f.Headers),
+				"headers":  r.buildExporterHeaders(authKey, authValue, "otel-logs", f.TargetDataset, tenantID, config.Spec.Target.Headers, f.Headers),
 			}
 			pipelines["logs/"+id] = map[string]interface{}{
 				"receivers":  []interface{}{"filelog/" + id},
@@ -706,7 +696,7 @@ func (r *ParseableConfigReconciler) buildLogCollectorConfig(ctx context.Context,
 		exporters["otlphttp/clustermetrics"] = map[string]interface{}{
 			"endpoint": endpoint,
 			"encoding": encoding,
-			"headers":  r.buildExporterHeaders(basicAuth, "otel-metrics", cm.TargetDataset, tenantID, config.Spec.Target.Headers, nil),
+			"headers":  r.buildExporterHeaders(authKey, authValue, "otel-metrics", cm.TargetDataset, tenantID, config.Spec.Target.Headers, nil),
 		}
 		// kubeletstats's /stats/summary response already carries k8s.namespace.name,
 		// k8s.pod.name, k8s.container.name, k8s.node.name as resource attributes,
@@ -828,15 +818,10 @@ func (r *ParseableConfigReconciler) buildMetricsEventsCollectorConfig(
 ) (map[string]interface{}, error) {
 	_ = metricsEnabled // gating is per-section below
 
-	secret := &corev1.Secret{}
-	secretRef := config.Spec.Target.CredentialsSecret
-	if err := r.Get(ctx, client.ObjectKey{Name: secretRef.Name, Namespace: secretRef.Namespace}, secret); err != nil {
-		return nil, fmt.Errorf("failed to read credentials secret %s/%s: %w", secretRef.Namespace, secretRef.Name, err)
+	authKey, authValue, err := r.resolveAuthHeader(ctx, config.Spec.Target)
+	if err != nil {
+		return nil, err
 	}
-
-	username := string(secret.Data["username"])
-	password := string(secret.Data["password"])
-	basicAuth := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", username, password)))
 	endpoint := strings.TrimRight(config.Spec.Target.Endpoint, "/")
 	encoding := resolveOtlpEncoding(config.Spec.Target.Encoding)
 	tenantID := config.Spec.Target.GlobalTenantID
@@ -922,7 +907,7 @@ func (r *ParseableConfigReconciler) buildMetricsEventsCollectorConfig(
 		exporters["otlphttp/clustermetrics"] = map[string]interface{}{
 			"endpoint": endpoint,
 			"encoding": encoding,
-			"headers":  r.buildExporterHeaders(basicAuth, "otel-metrics", cm.TargetDataset, tenantID, config.Spec.Target.Headers, cm.Headers),
+			"headers":  r.buildExporterHeaders(authKey, authValue, "otel-metrics", cm.TargetDataset, tenantID, config.Spec.Target.Headers, cm.Headers),
 		}
 		pipelines["metrics/cluster"] = map[string]interface{}{
 			"receivers":  clusterReceivers,
@@ -1007,7 +992,7 @@ func (r *ParseableConfigReconciler) buildMetricsEventsCollectorConfig(
 			exporters["otlphttp/metrics_"+id] = map[string]interface{}{
 				"endpoint": endpoint,
 				"encoding": encoding,
-				"headers":  r.buildExporterHeaders(basicAuth, "otel-metrics", sc.TargetDataset, tenantID, config.Spec.Target.Headers, sc.Headers),
+				"headers":  r.buildExporterHeaders(authKey, authValue, "otel-metrics", sc.TargetDataset, tenantID, config.Spec.Target.Headers, sc.Headers),
 			}
 			pipelines["metrics/"+id] = map[string]interface{}{
 				"receivers":  []interface{}{"prometheus/" + id},
@@ -1055,7 +1040,7 @@ func (r *ParseableConfigReconciler) buildMetricsEventsCollectorConfig(
 		exporters["otlphttp/events"] = map[string]interface{}{
 			"endpoint": endpoint,
 			"encoding": encoding,
-			"headers":  r.buildExporterHeaders(basicAuth, "otel-logs", events.TargetDataset, tenantID, config.Spec.Target.Headers, events.Headers),
+			"headers":  r.buildExporterHeaders(authKey, authValue, "otel-logs", events.TargetDataset, tenantID, config.Spec.Target.Headers, events.Headers),
 		}
 
 		pipelines["logs"] = map[string]interface{}{
@@ -1158,10 +1143,38 @@ func sanitizeName(s string) string {
 	return out
 }
 
+// resolveAuthHeader reads the credentials secret referenced by target and returns the
+// header name + value the collector/instrumentation should send to Parseable. Basic auth
+// (default) produces Authorization: Basic <b64>; apiKey produces x-api-key: <key>.
+func (r *ParseableConfigReconciler) resolveAuthHeader(ctx context.Context, target observabilityv1alpha1.TargetConfig) (string, string, error) {
+	secret := &corev1.Secret{}
+	ref := target.CredentialsSecret
+	if err := r.Get(ctx, client.ObjectKey{Name: ref.Name, Namespace: ref.Namespace}, secret); err != nil {
+		return "", "", fmt.Errorf("failed to read credentials secret %s/%s: %w", ref.Namespace, ref.Name, err)
+	}
+	switch target.AuthType {
+	case "apiKey":
+		apiKey := string(secret.Data["apiKey"])
+		if apiKey == "" {
+			return "", "", fmt.Errorf("credentials secret %s/%s missing 'apiKey' data key for authType=apiKey", ref.Namespace, ref.Name)
+		}
+		return "x-api-key", apiKey, nil
+	case "", "basic":
+		username := string(secret.Data["username"])
+		password := string(secret.Data["password"])
+		if username == "" || password == "" {
+			return "", "", fmt.Errorf("credentials secret %s/%s missing 'username' or 'password' data key for basic auth", ref.Namespace, ref.Name)
+		}
+		return "Authorization", fmt.Sprintf("Basic %s", base64.StdEncoding.EncodeToString([]byte(username+":"+password))), nil
+	default:
+		return "", "", fmt.Errorf("unsupported target.authType %q (want basic or apiKey)", target.AuthType)
+	}
+}
+
 // buildExporterHeaders returns a merged headers map for collector exporters.
-// Merge order: globalHeaders → signalHeaders → built-in headers (Authorization, X-P-Stream, X-P-Log-Source, X-P-Tenant).
+// Merge order: globalHeaders → signalHeaders → built-in headers (auth, X-P-Stream, X-P-Log-Source, X-P-Tenant).
 // Built-in headers always win.
-func (r *ParseableConfigReconciler) buildExporterHeaders(basicAuth, logSource, dataset, tenantID string, globalHeaders, signalHeaders map[string]string) map[string]interface{} {
+func (r *ParseableConfigReconciler) buildExporterHeaders(authKey, authValue, logSource, dataset, tenantID string, globalHeaders, signalHeaders map[string]string) map[string]interface{} {
 	headers := map[string]interface{}{}
 	// 1. Global headers
 	for k, v := range globalHeaders {
@@ -1172,7 +1185,7 @@ func (r *ParseableConfigReconciler) buildExporterHeaders(basicAuth, logSource, d
 		headers[k] = v
 	}
 	// 3. Built-in headers (always win)
-	headers["Authorization"] = fmt.Sprintf("Basic %s", basicAuth)
+	headers[authKey] = authValue
 	headers["X-P-Log-Source"] = logSource
 	headers["X-P-Stream"] = dataset
 	if tenantID != "" {
@@ -1183,7 +1196,7 @@ func (r *ParseableConfigReconciler) buildExporterHeaders(basicAuth, logSource, d
 
 // buildOtlpHeaders returns a comma-delimited OTEL_EXPORTER_OTLP_HEADERS value for instrumentation env vars.
 // Merge order: globalHeaders → signalHeaders → built-in headers.
-func (r *ParseableConfigReconciler) buildOtlpHeaders(basicAuth, logSource, dataset, tenantID string, globalHeaders, signalHeaders map[string]string) string {
+func (r *ParseableConfigReconciler) buildOtlpHeaders(authKey, authValue, logSource, dataset, tenantID string, globalHeaders, signalHeaders map[string]string) string {
 	merged := map[string]string{}
 	for k, v := range globalHeaders {
 		merged[k] = v
@@ -1192,7 +1205,7 @@ func (r *ParseableConfigReconciler) buildOtlpHeaders(basicAuth, logSource, datas
 		merged[k] = v
 	}
 	// Built-in headers always win
-	merged["Authorization"] = fmt.Sprintf("Basic %s", basicAuth)
+	merged[authKey] = authValue
 	merged["X-P-Log-Source"] = logSource
 	merged["X-P-Stream"] = dataset
 	if tenantID != "" {
