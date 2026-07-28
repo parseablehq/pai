@@ -138,7 +138,7 @@ func TestTraceCollectorExporterAuthentication(t *testing.T) {
 	}
 }
 
-func TestTraceCollectorCRHasTwoReplicas(t *testing.T) {
+func TestTraceCollectorCRHasOneReplica(t *testing.T) {
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: "parseable-creds", Namespace: "pai-system"},
 		Data:       map[string][]byte{"username": []byte("admin"), "password": []byte("admin")},
@@ -156,8 +156,8 @@ func TestTraceCollectorCRHasTwoReplicas(t *testing.T) {
 		t.Fatal(err)
 	}
 	replicas, found, err := unstructured.NestedInt64(collector.Object, "spec", "replicas")
-	if err != nil || !found || replicas != 2 {
-		t.Fatalf("replicas = %d, found = %v, err = %v; want 2", replicas, found, err)
+	if err != nil || !found || replicas != 1 {
+		t.Fatalf("replicas = %d, found = %v, err = %v; want 1", replicas, found, err)
 	}
 }
 

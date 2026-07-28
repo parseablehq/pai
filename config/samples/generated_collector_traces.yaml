@@ -9,7 +9,7 @@ metadata:
   namespace: pai-system
 spec:
   mode: deployment
-  replicas: 2
+  replicas: 1
   config:
     receivers:
       otlp:

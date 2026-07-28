@@ -140,7 +140,7 @@ Once the `ParseableConfig` CR is applied, PAI automatically creates the followin
 |----------|------|---------|
 | `pai-log-collector` | OTel Collector (DaemonSet) | Collects logs via filelog receiver, node/pod metrics via kubeletstats |
 | `pai-metrics-events-collector` | OTel Collector (Deployment) | Collects pod metrics via k8s_cluster receiver, events via k8sobjects |
-| `pai-traces` | OTel Collector (Deployment, 2 replicas) | Receives application traces and exports them to Parseable |
+| `pai-traces` | OTel Collector (Deployment, 1 replica) | Receives application traces and exports them to Parseable |
 | `pai-instrumentation-collector-v1` | Instrumentation CR | Auto-instruments workloads and routes traces through the in-cluster collector |
 | `pai-agent` | DaemonSet | Detects application languages for distroless containers |
 | `<namespace>-pai-collector` | ClusterRole | RBAC for collector service accounts |

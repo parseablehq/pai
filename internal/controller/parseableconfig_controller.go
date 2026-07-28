@@ -261,7 +261,7 @@ func (r *ParseableConfigReconciler) ensureTraceCollector(ctx context.Context, co
 
 	spec := map[string]interface{}{
 		"mode":     "deployment",
-		"replicas": int64(2),
+		"replicas": int64(1),
 		"config":   collectorConfig,
 	}
 
