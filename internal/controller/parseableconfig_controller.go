@@ -28,6 +28,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -47,7 +48,8 @@ import (
 )
 
 const (
-	instrumentationName = "pai-instrumentation"
+	instrumentationName       = "pai-instrumentation-collector-v1"
+	legacyInstrumentationName = "pai-instrumentation"
 
 	// kept for cleanup of legacy sidecar resources
 	sidecarCollectorName = "pai-sidecar"
@@ -55,6 +57,8 @@ const (
 
 	logCollectorName           = "pai-log-collector"
 	metricsEventsCollectorName = "pai-metrics-events-collector"
+	traceCollectorName         = "pai-traces"
+	traceCollectorPort         = 4318
 	collectorClusterRoleName   = "pai-collector"
 	paiAgentDaemonSetName      = "pai-agent"
 
@@ -178,7 +182,13 @@ func (r *ParseableConfigReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		}
 	}
 
-	// Step 1: Ensure Instrumentation CR exists (sends traces directly to Parseable)
+	// Step 1: Ensure the trace collector exists before routing instrumentation to it.
+	if err := r.ensureTraceCollector(ctx, config); err != nil {
+		logger.Error(err, "Failed to ensure trace collector")
+		return ctrl.Result{}, err
+	}
+
+	// Step 2: Ensure Instrumentation CR exists.
 	if err := r.ensureInstrumentation(ctx, config); err != nil {
 		logger.Error(err, "Failed to ensure Instrumentation CR")
 		return ctrl.Result{}, err
@@ -215,6 +225,125 @@ func (r *ParseableConfigReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	}
 
 	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+}
+
+// ensureTraceCollector creates or updates the Deployment-mode collector that
+// receives application traces and exports them to Parseable.
+func (r *ParseableConfigReconciler) ensureTraceCollector(ctx context.Context, config *observabilityv1alpha1.ParseableConfig) error {
+	logger := log.FromContext(ctx)
+	gvk := schema.GroupVersionKind{
+		Group:   "opentelemetry.io",
+		Version: "v1beta1",
+		Kind:    "OpenTelemetryCollector",
+	}
+
+	existing := &unstructured.Unstructured{}
+	existing.SetGroupVersionKind(gvk)
+	err := r.Get(ctx, client.ObjectKey{Name: traceCollectorName, Namespace: config.Namespace}, existing)
+
+	tracesEnabled := config.Spec.Traces != nil &&
+		config.Spec.Traces.TargetDataset != "" &&
+		len(config.Spec.Traces.Instrumentation.Languages) > 0
+	if !tracesEnabled {
+		if err == nil {
+			logger.Info("Traces not configured, deleting trace collector")
+			if delErr := r.Delete(ctx, existing); delErr != nil && !errors.IsNotFound(delErr) {
+				return fmt.Errorf("failed to delete trace collector: %w", delErr)
+			}
+		}
+		return nil
+	}
+
+	collectorConfig, cfgErr := r.buildTraceCollectorConfig(ctx, config)
+	if cfgErr != nil {
+		return cfgErr
+	}
+
+	spec := map[string]interface{}{
+		"mode":     "deployment",
+		"replicas": int64(2),
+		"config":   collectorConfig,
+	}
+
+	if err == nil {
+		if apiequality.Semantic.DeepDerivative(spec, existing.Object["spec"]) {
+			return nil
+		}
+		existing.Object["spec"] = spec
+		if updErr := r.Update(ctx, existing); updErr != nil {
+			return fmt.Errorf("failed to update trace collector: %w", updErr)
+		}
+		logger.Info("Trace collector updated")
+		return nil
+	}
+	if !errors.IsNotFound(err) {
+		return fmt.Errorf("failed to check trace collector: %w", err)
+	}
+
+	collector := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "opentelemetry.io/v1beta1",
+			"kind":       "OpenTelemetryCollector",
+			"metadata": map[string]interface{}{
+				"name":      traceCollectorName,
+				"namespace": config.Namespace,
+			},
+			"spec": spec,
+		},
+	}
+	if createErr := r.Create(ctx, collector); createErr != nil {
+		return fmt.Errorf("failed to create trace collector: %w", createErr)
+	}
+	logger.Info("Trace collector created successfully")
+	return nil
+}
+
+// buildTraceCollectorConfig builds a traces-only OTLP pipeline. Applications
+// send OTLP/HTTP protobuf to this collector.
+func (r *ParseableConfigReconciler) buildTraceCollectorConfig(ctx context.Context, config *observabilityv1alpha1.ParseableConfig) (map[string]interface{}, error) {
+	authKey, authValue, err := r.resolveAuthHeader(ctx, config.Spec.Target)
+	if err != nil {
+		return nil, err
+	}
+
+	return map[string]interface{}{
+		"receivers": map[string]interface{}{
+			"otlp": map[string]interface{}{
+				"protocols": map[string]interface{}{
+					"http": map[string]interface{}{
+						"endpoint": fmt.Sprintf("0.0.0.0:%d", traceCollectorPort),
+					},
+				},
+			},
+		},
+		"processors": map[string]interface{}{
+			"batch": map[string]interface{}{},
+		},
+		"exporters": map[string]interface{}{
+			"otlphttp/traces": map[string]interface{}{
+				"endpoint": strings.TrimRight(config.Spec.Target.Endpoint, "/"),
+				"encoding": resolveOtlpEncoding(config.Spec.Target.Encoding),
+				"headers": r.buildExporterHeaders(
+					authKey,
+					authValue,
+					"otel-traces",
+					config.Spec.Traces.TargetDataset,
+					config.Spec.Target.GlobalTenantID,
+					config.Spec.Target.Headers,
+					config.Spec.Traces.Headers,
+				),
+			},
+		},
+		"service": map[string]interface{}{
+			"pipelines": map[string]interface{}{
+				"traces": map[string]interface{}{
+					"receivers":  []interface{}{"otlp"},
+					"processors": []interface{}{"batch"},
+					"exporters":  []interface{}{"otlphttp/traces"},
+				},
+			},
+		},
+	}, nil
 }
 
 // ensureCollectorRBAC creates a ClusterRole and ClusterRoleBindings for collector ServiceAccounts.
@@ -318,16 +447,10 @@ func (r *ParseableConfigReconciler) ensureCollectorRBAC(ctx context.Context, nam
 	return nil
 }
 
-// buildInstrumentationSpec builds the Instrumentation spec that sends traces directly to Parseable
-func (r *ParseableConfigReconciler) buildInstrumentationSpec(ctx context.Context, config *observabilityv1alpha1.ParseableConfig) (map[string]interface{}, error) {
-	authKey, authValue, err := r.resolveAuthHeader(ctx, config.Spec.Target)
-	if err != nil {
-		return nil, err
-	}
-
-	tracesStream := config.Spec.Traces.TargetDataset
-	endpoint := strings.TrimRight(config.Spec.Target.Endpoint, "/")
-
+// buildInstrumentationSpec builds the Instrumentation spec that sends traces to
+// the stable in-cluster trace collector.
+func (r *ParseableConfigReconciler) buildInstrumentationSpec(config *observabilityv1alpha1.ParseableConfig) map[string]interface{} {
+	endpoint := fmt.Sprintf("http://%s-collector.%s:%d", traceCollectorName, config.Namespace, traceCollectorPort)
 	spec := map[string]interface{}{
 		"exporter": map[string]interface{}{
 			"endpoint": endpoint,
@@ -339,11 +462,15 @@ func (r *ParseableConfigReconciler) buildInstrumentationSpec(ctx context.Context
 		"env": []interface{}{
 			map[string]interface{}{
 				"name":  "OTEL_EXPORTER_OTLP_PROTOCOL",
-				"value": resolveOtlpProtocol(config.Spec.Target.Encoding),
+				"value": "http/protobuf",
 			},
 			map[string]interface{}{
-				"name":  "OTEL_EXPORTER_OTLP_HEADERS",
-				"value": r.buildOtlpHeaders(authKey, authValue, "otel-traces", tracesStream, config.Spec.Target.GlobalTenantID, config.Spec.Target.Headers, config.Spec.Traces.Headers),
+				"name":  "OTEL_LOGS_EXPORTER",
+				"value": "none",
+			},
+			map[string]interface{}{
+				"name":  "OTEL_METRICS_EXPORTER",
+				"value": "none",
 			},
 		},
 	}
@@ -358,7 +485,7 @@ func (r *ParseableConfigReconciler) buildInstrumentationSpec(ctx context.Context
 		}
 	}
 
-	return spec, nil
+	return spec
 }
 
 // ensureInstrumentation creates or updates the Instrumentation CR with language sections based on the ParseableConfig
@@ -382,12 +509,12 @@ func (r *ParseableConfigReconciler) ensureInstrumentation(ctx context.Context, c
 		return fmt.Errorf("failed to check Instrumentation CR: %w", err)
 	}
 
-	spec, specErr := r.buildInstrumentationSpec(ctx, config)
-	if specErr != nil {
-		return specErr
-	}
+	spec := r.buildInstrumentationSpec(config)
 
 	if err == nil {
+		if apiequality.Semantic.DeepDerivative(spec, existing.Object["spec"]) {
+			return nil
+		}
 		// Update existing CR with current languages
 		existing.Object["spec"] = spec
 		if err := r.Update(ctx, existing); err != nil {
@@ -1081,15 +1208,6 @@ func resolveOtlpEncoding(target string) string {
 	return "json"
 }
 
-// resolveOtlpProtocol returns the OTEL_EXPORTER_OTLP_PROTOCOL env-var value
-// for SDK instrumentation, matching the target encoding.
-func resolveOtlpProtocol(target string) string {
-	if target == "proto" {
-		return "http/protobuf"
-	}
-	return "http/json"
-}
-
 // sanitizePromLabel converts a Kubernetes label key into the Prometheus relabel form
 // (alphanumeric + underscore). Mirrors Prometheus' own label-name sanitization rules.
 func sanitizePromLabel(s string) string {
@@ -1192,30 +1310,6 @@ func (r *ParseableConfigReconciler) buildExporterHeaders(authKey, authValue, log
 		headers["X-P-Tenant"] = tenantID
 	}
 	return headers
-}
-
-// buildOtlpHeaders returns a comma-delimited OTEL_EXPORTER_OTLP_HEADERS value for instrumentation env vars.
-// Merge order: globalHeaders → signalHeaders → built-in headers.
-func (r *ParseableConfigReconciler) buildOtlpHeaders(authKey, authValue, logSource, dataset, tenantID string, globalHeaders, signalHeaders map[string]string) string {
-	merged := map[string]string{}
-	for k, v := range globalHeaders {
-		merged[k] = v
-	}
-	for k, v := range signalHeaders {
-		merged[k] = v
-	}
-	// Built-in headers always win
-	merged[authKey] = authValue
-	merged["X-P-Log-Source"] = logSource
-	merged["X-P-Stream"] = dataset
-	if tenantID != "" {
-		merged["X-P-Tenant"] = tenantID
-	}
-	var parts []string
-	for k, v := range merged {
-		parts = append(parts, fmt.Sprintf("%s=%s", k, v))
-	}
-	return strings.Join(parts, ",")
 }
 
 // workloadKey returns a unique key for a workload (kind/namespace/name)
@@ -1392,6 +1486,10 @@ func (r *ParseableConfigReconciler) ensureAnnotations(ctx context.Context, confi
 	}
 
 	// Filter out already-processed workloads (using status + image change detection)
+	// TODO: Reconcile de-instrumentation when a language is removed or a workload
+	// becomes excluded by selectors.
+	// TODO: Remove stale language injection annotations when an image changes its
+	// detected language. Define agent-image upgrade rollout policy separately.
 	var needsDetection []client.Object
 	for _, obj := range allWorkloads {
 		w := r.wrapWorkload(obj)
@@ -1400,6 +1498,13 @@ func (r *ParseableConfigReconciler) ensureAnnotations(ctx context.Context, confi
 			currentImage = w.getContainerImage()
 		}
 		if ws := isWorkloadProcessed(config, obj, currentImage); ws != nil {
+			if ws.Instrumented && ws.DetectedLanguage != "" {
+				if !r.hasDesiredInstrumentationAnnotation(obj, config.Namespace, ws.DetectedLanguage) {
+					if err := r.ensureWorkloadInstrumentation(ctx, obj, config.Namespace, ws.DetectedLanguage); err != nil {
+						return err
+					}
+				}
+			}
 			logger.Info("Workload already processed, skipping",
 				"name", obj.GetName(), "namespace", obj.GetNamespace(),
 				"language", ws.DetectedLanguage, "instrumented", ws.Instrumented)
@@ -1452,25 +1557,32 @@ func (r *ParseableConfigReconciler) cleanup(ctx context.Context, config *observa
 		}
 	}
 
-	// Step 2: Delete Instrumentation CR
-	logger.Info("Deleting Instrumentation CR", "name", instrumentationName, "namespace", config.Namespace)
-	instrumentation := &unstructured.Unstructured{}
-	instrumentation.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   "opentelemetry.io",
-		Version: "v1alpha1",
-		Kind:    "Instrumentation",
-	})
-	instrumentation.SetName(instrumentationName)
-	instrumentation.SetNamespace(config.Namespace)
-	if err := r.Delete(ctx, instrumentation); err != nil {
-		if !errors.IsNotFound(err) {
-			logger.Error(err, "Failed to delete Instrumentation CR")
+	// Step 2: Delete current and legacy Instrumentation CRs. The legacy CR is
+	// retained during normal reconciliation so partially migrated workloads can
+	// continue starting until their injection reference is updated.
+	for _, name := range []string{instrumentationName, legacyInstrumentationName} {
+		logger.Info("Deleting Instrumentation CR", "name", name, "namespace", config.Namespace)
+		instrumentation := &unstructured.Unstructured{}
+		instrumentation.SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   "opentelemetry.io",
+			Version: "v1alpha1",
+			Kind:    "Instrumentation",
+		})
+		instrumentation.SetName(name)
+		instrumentation.SetNamespace(config.Namespace)
+		if err := r.Delete(ctx, instrumentation); err != nil {
+			if !errors.IsNotFound(err) {
+				logger.Error(err, "Failed to delete Instrumentation CR", "name", name)
+			}
+		} else {
+			logger.Info("Instrumentation CR deleted", "name", name)
 		}
-	} else {
-		logger.Info("Instrumentation CR deleted")
 	}
 
-	// Step 3: Delete Log Collector CR
+	// Step 3: Delete Trace Collector CR
+	r.deleteCollectorCR(ctx, traceCollectorName, config.Namespace)
+
+	// Step 4: Delete Log Collector CR
 	logger.Info("Deleting Log Collector CR", "name", logCollectorName, "namespace", config.Namespace)
 	logCollector := &unstructured.Unstructured{}
 	logCollector.SetGroupVersionKind(schema.GroupVersionKind{
@@ -1488,10 +1600,10 @@ func (r *ParseableConfigReconciler) cleanup(ctx context.Context, config *observa
 		logger.Info("Log Collector CR deleted")
 	}
 
-	// Step 4: Delete Metrics/Events Collector CR
+	// Step 5: Delete Metrics/Events Collector CR
 	r.deleteCollectorCR(ctx, metricsEventsCollectorName, config.Namespace)
 
-	// Step 5: Delete PAI agent DaemonSet
+	// Step 6: Delete PAI agent DaemonSet
 	logger.Info("Deleting PAI agent DaemonSet")
 	agentDS := &appsv1.DaemonSet{}
 	if err := r.Get(ctx, client.ObjectKey{Name: paiAgentDaemonSetName, Namespace: config.Namespace}, agentDS); err == nil {
@@ -1502,7 +1614,7 @@ func (r *ParseableConfigReconciler) cleanup(ctx context.Context, config *observa
 		}
 	}
 
-	// Step 6: Delete Sidecar Collector CR (legacy)
+	// Step 7: Delete Sidecar Collector CR
 	logger.Info("Deleting Sidecar Collector CR", "name", sidecarCollectorName, "namespace", config.Namespace)
 	collector := &unstructured.Unstructured{}
 	collector.SetGroupVersionKind(schema.GroupVersionKind{
@@ -1754,8 +1866,36 @@ func (r *ParseableConfigReconciler) detectLanguage(ctx context.Context, config *
 		return nil
 	}
 
-	// Add instrumentation annotation (single rollout)
+	if err := r.ensureWorkloadInstrumentation(ctx, obj, config.Namespace, lang); err != nil {
+		return err
+	}
+
+	r.updateWorkloadStatus(ctx, config, obj, lang, true, containerImage)
+	return nil
+}
+
+// hasDesiredInstrumentationAnnotation checks the workload object already
+// returned by LIST. The normal reconciled path needs no additional GET.
+func (r *ParseableConfigReconciler) hasDesiredInstrumentationAnnotation(obj client.Object, instrumentationNamespace, lang string) bool {
+	w := r.wrapWorkload(obj)
+	if w == nil {
+		return false
+	}
+	annotations := w.getPodTemplateAnnotations()
+	if annotations == nil {
+		return false
+	}
 	key := instrumentationAnnotPrefix + lang
+	return annotations[key] == instrumentationNamespace+"/"+instrumentationName
+}
+
+// ensureWorkloadInstrumentation repairs a missing or incorrect injection
+// annotation. It re-fetches only workloads that failed the cached LIST check.
+func (r *ParseableConfigReconciler) ensureWorkloadInstrumentation(ctx context.Context, obj client.Object, instrumentationNamespace, lang string) error {
+	logger := log.FromContext(ctx)
+	key := instrumentationAnnotPrefix + lang
+	desiredInstrumentation := instrumentationNamespace + "/" + instrumentationName
+
 	for retry := 0; retry < 5; retry++ {
 		if err := r.Get(ctx, client.ObjectKeyFromObject(obj), obj); err != nil {
 			return fmt.Errorf("failed to re-fetch workload: %w", err)
@@ -1765,7 +1905,10 @@ func (r *ParseableConfigReconciler) detectLanguage(ctx context.Context, config *
 		if annotations == nil {
 			annotations = make(map[string]string)
 		}
-		annotations[key] = config.Namespace + "/" + instrumentationName
+		if annotations[key] == desiredInstrumentation {
+			return nil
+		}
+		annotations[key] = desiredInstrumentation
 		w.setPodTemplateAnnotations(annotations)
 
 		if err := r.Update(ctx, obj); err != nil {
@@ -1776,11 +1919,9 @@ func (r *ParseableConfigReconciler) detectLanguage(ctx context.Context, config *
 			}
 			return fmt.Errorf("failed to annotate workload %s/%s: %w", obj.GetNamespace(), obj.GetName(), err)
 		}
-		break
+		return nil
 	}
-
-	r.updateWorkloadStatus(ctx, config, obj, lang, true, containerImage)
-	return nil
+	return fmt.Errorf("failed to annotate workload %s/%s after conflict retries", obj.GetNamespace(), obj.GetName())
 }
 
 // detectLanguageByImage checks the container image name against known language patterns.

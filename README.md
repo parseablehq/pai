@@ -140,7 +140,8 @@ Once the `ParseableConfig` CR is applied, PAI automatically creates the followin
 |----------|------|---------|
 | `pai-log-collector` | OTel Collector (DaemonSet) | Collects logs via filelog receiver, node/pod metrics via kubeletstats |
 | `pai-metrics-events-collector` | OTel Collector (Deployment) | Collects pod metrics via k8s_cluster receiver, events via k8sobjects |
-| `pai-instrumentation` | Instrumentation CR | Auto-instruments workloads for distributed tracing |
+| `pai-traces` | OTel Collector (Deployment, 2 replicas) | Receives application traces and exports them to Parseable |
+| `pai-instrumentation-collector-v1` | Instrumentation CR | Auto-instruments workloads and routes traces through the in-cluster collector |
 | `pai-agent` | DaemonSet | Detects application languages for distroless containers |
 | `<namespace>-pai-collector` | ClusterRole | RBAC for collector service accounts |
 
@@ -155,7 +156,10 @@ Once the `ParseableConfig` CR is applied, PAI automatically creates the followin
 - Auto-instrumentation via OpenTelemetry SDK injection (init containers)
 - Supported languages: Java, Python, Node.js, .NET
 - Language detection order: image heuristics -> exec-based -> host /proc (for distroless)
-- Traces are sent directly from instrumented pods to Parseable
+- Instrumented pods send traces to the stable in-cluster `pai-traces-collector` Service
+- The trace collector owns the Parseable endpoint, authentication, and target dataset
+- Changing the Parseable target rolls the trace collector without restarting application workloads
+- Existing `pai-instrumentation` workload references migrate once to `pai-instrumentation-collector-v1`
 
 ### Metrics
 - **Pod metrics**: Container CPU, memory, network via `kubeletstats` and `k8s_cluster` receivers

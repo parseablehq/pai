@@ -1,0 +1,37 @@
+# This is the OpenTelemetryCollector CR that PAI generates when traces are enabled.
+# Instrumented applications send OTLP/HTTP protobuf to the Service generated for
+# this CR: pai-traces-collector.<namespace>:4318. The collector
+# adds Parseable authentication and dataset headers before exporting the spans.
+apiVersion: opentelemetry.io/v1beta1
+kind: OpenTelemetryCollector
+metadata:
+  name: pai-traces
+  namespace: pai-system
+spec:
+  mode: deployment
+  replicas: 2
+  config:
+    receivers:
+      otlp:
+        protocols:
+          http:
+            endpoint: 0.0.0.0:4318
+
+    processors:
+      batch: {}
+
+    exporters:
+      otlphttp/traces:
+        endpoint: http://<YOUR_PARSEABLE_ENDPOINT>:8010
+        encoding: proto
+        headers:
+          Authorization: "Basic <base64-encoded>"
+          X-P-Log-Source: otel-traces
+          X-P-Stream: pai-traces
+
+    service:
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [batch]
+          exporters: [otlphttp/traces]
