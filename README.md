@@ -38,7 +38,7 @@ helm install opentelemetry-operator open-telemetry/opentelemetry-operator \
 ### Step 1: Install PAI operator
 
 ```bash
-helm repo add parseable https://charts.parseable.com/helm-releases
+helm repo add parseable https://charts.parseable.com
 helm repo update
 helm install pai parseable/pai -n pai-system --create-namespace
 ```
@@ -211,6 +211,30 @@ kubectl get parseableconfig production -n pai-system -o yaml
 ```
 
 The `status.workloads` field shows which workloads were instrumented and their detected language.
+
+## Troubleshooting Collector Logs
+
+If data is not reaching Parseable, list the collector pods and inspect the logs for configuration, authentication, or export errors:
+
+```bash
+kubectl get pods -n pai-system
+kubectl logs -n pai-system <COLLECTOR_POD_NAME> --all-containers --tail=200
+```
+
+Use the collector for the signal being diagnosed:
+
+```bash
+# Logs (select the collector pod running on the affected node)
+kubectl logs -n pai-system <PAI_LOG_COLLECTOR_POD_NAME> --all-containers --tail=200
+
+# Metrics and events
+kubectl logs -n pai-system deployment/pai-metrics-events-collector-collector --all-containers --tail=200
+
+# Traces
+kubectl logs -n pai-system deployment/pai-traces-collector --all-containers --tail=200
+```
+
+Add `-f` to any command to stream the logs continuously.
 
 ## Uninstallation
 
