@@ -43,18 +43,22 @@ helm repo update
 helm install pai parseable/pai -n pai-system --create-namespace
 ```
 
-Or install from source:
-
-```bash
-helm install pai ./helm/pai -n pai-system --create-namespace
-```
-
 ### Step 2: Create credentials secret
+
+For basic authentication, create a secret with `username` and `password`:
 
 ```bash
 kubectl create secret generic parseable-creds \
   --from-literal=username=<PARSEABLE_USERNAME> \
   --from-literal=password=<PARSEABLE_PASSWORD> \
+  -n pai-system
+```
+
+For API-key authentication, create a secret with an `apiKey` key instead:
+
+```bash
+kubectl create secret generic parseable-creds \
+  --from-literal=apiKey=<PARSEABLE_API_KEY> \
   -n pai-system
 ```
 
@@ -71,6 +75,8 @@ metadata:
 spec:
   target:
     endpoint: https://<PARSEABLE_INGESTOR_ENDPOINT>
+    authType: apiKey
+    encoding: json
     credentialsSecret:
       name: parseable-creds
       namespace: pai-system
@@ -95,27 +101,29 @@ spec:
       detectionTimeout: "1m"
 
   logs:
-    targetDataset: logs
-    headers:
-      X-P-Telemetry-Type: "logs"
-    namespaceSelector:
-      mode: include
-      namespaces:
-        - app-namespace
+    podLogs:
+      enabled: true
+      targetDataset: logs
+      headers:
+        X-P-Telemetry-Type: "logs"
+      namespaceSelector:
+        mode: include
+        namespaces:
+          - app-namespace
 
   metrics:
-    podMetrics:
-      targetDataset: pod-metrics
+    clusterMetrics:
+      targetDataset: cluster-metrics
       headers:
         X-P-Telemetry-Type: "metrics"
       namespaceSelector:
         mode: include
         namespaces:
           - app-namespace
-    nodeMetrics:
-      targetDataset: node-metrics
-      headers:
-        X-P-Telemetry-Type: "metrics"
+      k8sCluster:
+        enabled: true
+      kubelet:
+        enabled: true
 
   events:
     enabled: true
@@ -151,6 +159,7 @@ Once the `ParseableConfig` CR is applied, PAI automatically creates the followin
 - Collected via the `filelog` receiver on every node
 - Enriched with Kubernetes metadata (pod, namespace, node, labels)
 - Namespace filtering via `namespaceSelector` (include/exclude mode)
+- Arbitrary host log directories can be tailed with `spec.logs.files`
 
 ### Traces
 - Auto-instrumentation via OpenTelemetry SDK injection (init containers)
@@ -162,9 +171,11 @@ Once the `ParseableConfig` CR is applied, PAI automatically creates the followin
 - Existing `pai-instrumentation` workload references migrate once to `pai-instrumentation-collector-v1`
 
 ### Metrics
-- **Pod metrics**: Container CPU, memory, network via `kubeletstats` and `k8s_cluster` receivers
-- **Node metrics**: Node-level CPU, memory, disk, network via `kubeletstats` receiver
-- Namespace filtering via `namespaceSelector`
+- **Kubernetes object state** via the `k8s_cluster` receiver
+- **Pod, container, and node resource metrics** via the `kubeletstats` receiver
+- **Kube-state-metrics** scraping when enabled and available in the cluster
+- **Application Prometheus metrics** via `spec.metrics.scrapeConfigs`
+- Namespace filtering applies to pod-scoped metrics; node-scoped metrics are not filtered
 
 ### Events
 - Kubernetes events collected via `k8sobjects` receiver in watch mode
@@ -172,7 +183,7 @@ Once the `ParseableConfig` CR is applied, PAI automatically creates the followin
 
 ## Namespace Selector
 
-Each signal supports a `namespaceSelector` with two modes:
+Kubernetes-aware signal configurations support a `namespaceSelector` with two modes:
 
 - **include**: Only collect from the listed namespaces
 - **exclude**: Collect from all namespaces except the listed ones
@@ -191,7 +202,7 @@ namespaceSelector:
 Headers can be set at two levels:
 
 1. **Global** (`spec.target.headers`) - Applied to all signal exporters
-2. **Signal-level** (`spec.logs.headers`, `spec.traces.headers`, etc.) - Overrides global headers with the same key
+2. **Signal-level** (`spec.logs.podLogs.headers`, `spec.logs.files[].headers`, `spec.metrics.clusterMetrics.headers`, `spec.metrics.scrapeConfigs[].headers`, `spec.traces.headers`, and `spec.events.headers`) - Overrides global headers with the same key
 
 Built-in headers (`Authorization`, `X-P-Stream`, `X-P-Log-Source`, `X-P-Tenant`) always take precedence.
 
