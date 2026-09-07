@@ -146,6 +146,15 @@ spec:
                         description: TargetDataset is the Parseable dataset name for
                           pod log data (required when Enabled is true)
                         type: string
+                      transformStatements:
+                        description: |-
+                          TransformStatements are OTTL statements (log context) applied via a
+                          transform processor between k8sattributes and batch. Runs with
+                          error_mode: ignore so a statement that fails on a record leaves that
+                          record unmodified.
+                        items:
+                          type: string
+                        type: array
                     required:
                     - enabled
                     type: object

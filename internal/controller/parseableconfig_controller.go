@@ -767,9 +767,27 @@ func (r *ParseableConfigReconciler) buildLogCollectorConfig(ctx context.Context,
 			"encoding": encoding,
 			"headers":  r.buildExporterHeaders(authKey, authValue, "otel-logs", pl.TargetDataset, tenantID, config.Spec.Target.Headers, pl.Headers),
 		}
+		podLogsProcessors := []interface{}{"k8sattributes"}
+		if len(pl.TransformStatements) > 0 {
+			statements := make([]interface{}, 0, len(pl.TransformStatements))
+			for _, s := range pl.TransformStatements {
+				statements = append(statements, s)
+			}
+			processors["transform/pod-logs"] = map[string]interface{}{
+				"error_mode": "ignore",
+				"log_statements": []interface{}{
+					map[string]interface{}{
+						"context":    "log",
+						"statements": statements,
+					},
+				},
+			}
+			podLogsProcessors = append(podLogsProcessors, "transform/pod-logs")
+		}
+		podLogsProcessors = append(podLogsProcessors, "batch")
 		pipelines["logs/pod-logs"] = map[string]interface{}{
 			"receivers":  []interface{}{"filelog/pod-logs"},
-			"processors": []interface{}{"k8sattributes", "batch"},
+			"processors": podLogsProcessors,
 			"exporters":  []interface{}{"otlphttp/logs_pod-logs"},
 		}
 	}

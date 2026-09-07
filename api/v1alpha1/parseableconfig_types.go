@@ -130,6 +130,12 @@ type PodLogsConfig struct {
 
 	// NamespaceSelector defines which namespaces to collect pod logs from
 	NamespaceSelector NamespaceSelector `json:"namespaceSelector,omitempty"`
+
+	// TransformStatements are OTTL statements (log context) applied via a
+	// transform processor between k8sattributes and batch. Runs with
+	// error_mode: ignore so a statement that fails on a record leaves that
+	// record unmodified.
+	TransformStatements []string `json:"transformStatements,omitempty"`
 }
 
 // FileLogConfig defines a host-path tail pipeline. Every *.log file under
