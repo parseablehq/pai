@@ -234,6 +234,11 @@ type ScrapeConfig struct {
 	// PodSelector selects pods by label key/value pairs. When set, the operator emits
 	// a Prometheus keep-relabel per label and skips the port-number filter.
 	PodSelector map[string]string `json:"podSelector,omitempty"`
+
+	// DropLabels lists metric label names to strip after scraping (emitted as
+	// labeldrop metric_relabel_configs). Useful when a label's values would
+	// conflict with an existing column type in the target dataset.
+	DropLabels []string `json:"dropLabels,omitempty"`
 }
 
 // MetricsConfig defines metrics configuration. ClusterMetrics enables built-in

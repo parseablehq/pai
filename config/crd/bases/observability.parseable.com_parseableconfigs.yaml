@@ -263,6 +263,14 @@ spec:
                           - PodSelector (label match) — recommended; matches pods by label key/value
                           - port-only — keeps pods whose container exposes the named port (legacy)
                       properties:
+                        dropLabels:
+                          description: |-
+                            DropLabels lists metric label names to strip after scraping (emitted as
+                            labeldrop metric_relabel_configs). Useful when a label's values would
+                            conflict with an existing column type in the target dataset.
+                          items:
+                            type: string
+                          type: array
                         headers:
                           additionalProperties:
                             type: string

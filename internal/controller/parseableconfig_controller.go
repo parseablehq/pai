@@ -1127,17 +1127,26 @@ func (r *ParseableConfigReconciler) buildMetricsEventsCollectorConfig(
 				}, relabelConfigs...)
 			}
 
+			scrapeConfig := map[string]interface{}{
+				"job_name":              id,
+				"scrape_interval":       "30s",
+				"metrics_path":          metricsPath,
+				"kubernetes_sd_configs": []interface{}{sdConfig},
+				"relabel_configs":       relabelConfigs,
+			}
+			if len(sc.DropLabels) > 0 {
+				var metricRelabels []interface{}
+				for _, l := range sc.DropLabels {
+					metricRelabels = append(metricRelabels, map[string]interface{}{
+						"action": "labeldrop",
+						"regex":  l,
+					})
+				}
+				scrapeConfig["metric_relabel_configs"] = metricRelabels
+			}
 			receivers["prometheus/"+id] = map[string]interface{}{
 				"config": map[string]interface{}{
-					"scrape_configs": []interface{}{
-						map[string]interface{}{
-							"job_name":              id,
-							"scrape_interval":       "30s",
-							"metrics_path":          metricsPath,
-							"kubernetes_sd_configs": []interface{}{sdConfig},
-							"relabel_configs":       relabelConfigs,
-						},
-					},
+					"scrape_configs": []interface{}{scrapeConfig},
 				},
 			}
 			exporters["otlphttp/metrics_"+id] = map[string]interface{}{
