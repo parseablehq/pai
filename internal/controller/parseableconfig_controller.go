@@ -363,7 +363,8 @@ func (r *ParseableConfigReconciler) ensureCollectorRBAC(ctx context.Context, nam
 				APIGroups: []string{""},
 				Resources: []string{"events", "namespaces", "namespaces/status",
 					"nodes", "nodes/spec", "nodes/stats", "nodes/proxy", "nodes/metrics",
-					"pods", "pods/status", "replicationcontrollers", "replicationcontrollers/status",
+					"persistentvolumeclaims", "pods", "pods/status",
+					"replicationcontrollers", "replicationcontrollers/status",
 					"resourcequotas", "services", "endpoints"},
 				Verbs: []string{"get", "list", "watch"},
 			},
@@ -843,6 +844,11 @@ func (r *ParseableConfigReconciler) buildLogCollectorConfig(ctx context.Context,
 			"auth_type":            "serviceAccount",
 			"endpoint":             "https://${env:K8S_NODE_NAME}:10250",
 			"insecure_skip_verify": true,
+			// volume group adds k8s.volume.available/capacity per mounted volume;
+			// k8s_api_config lets the receiver resolve PVC names for those series.
+			"metric_groups":         []interface{}{"container", "pod", "node", "volume"},
+			"extra_metadata_labels": []interface{}{"k8s.volume.type"},
+			"k8s_api_config":        map[string]interface{}{"auth_type": "serviceAccount"},
 		}
 		exporters["otlphttp/clustermetrics"] = map[string]interface{}{
 			"endpoint": endpoint,
