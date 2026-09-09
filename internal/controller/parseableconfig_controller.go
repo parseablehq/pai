@@ -1127,12 +1127,16 @@ func (r *ParseableConfigReconciler) buildMetricsEventsCollectorConfig(
 				}, relabelConfigs...)
 			}
 
+			scrapeInterval := "30s"
+			if sc.ScrapeIntervalSeconds > 0 {
+				scrapeInterval = fmt.Sprintf("%ds", sc.ScrapeIntervalSeconds)
+			}
 			receivers["prometheus/"+id] = map[string]interface{}{
 				"config": map[string]interface{}{
 					"scrape_configs": []interface{}{
 						map[string]interface{}{
 							"job_name":              id,
-							"scrape_interval":       "30s",
+							"scrape_interval":       scrapeInterval,
 							"metrics_path":          metricsPath,
 							"kubernetes_sd_configs": []interface{}{sdConfig},
 							"relabel_configs":       relabelConfigs,
