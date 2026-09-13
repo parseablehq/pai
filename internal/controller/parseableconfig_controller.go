@@ -347,7 +347,8 @@ func (r *ParseableConfigReconciler) buildTraceCollectorConfig(ctx context.Contex
 }
 
 // ensureCollectorRBAC creates a ClusterRole and ClusterRoleBindings for collector ServiceAccounts.
-// The k8s_cluster, k8sobjects, and kubeletstats receivers need permissions to list/watch cluster resources.
+// The k8s_cluster, k8sobjects, kubeletstats, and Prometheus service-discovery
+// receivers need permissions to list/watch cluster resources.
 func (r *ParseableConfigReconciler) ensureCollectorRBAC(ctx context.Context, namespace string) error {
 	logger := log.FromContext(ctx)
 
@@ -363,8 +364,13 @@ func (r *ParseableConfigReconciler) ensureCollectorRBAC(ctx context.Context, nam
 				Resources: []string{"events", "namespaces", "namespaces/status",
 					"nodes", "nodes/spec", "nodes/stats", "nodes/proxy", "nodes/metrics",
 					"pods", "pods/status", "replicationcontrollers", "replicationcontrollers/status",
-					"resourcequotas", "services"},
+					"resourcequotas", "services", "endpoints"},
 				Verbs: []string{"get", "list", "watch"},
+			},
+			{
+				APIGroups: []string{"discovery.k8s.io"},
+				Resources: []string{"endpointslices"},
+				Verbs:     []string{"get", "list", "watch"},
 			},
 			{
 				APIGroups: []string{"apps"},
