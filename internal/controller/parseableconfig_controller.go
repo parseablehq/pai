@@ -21,6 +21,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -30,6 +31,7 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
@@ -219,9 +221,20 @@ func (r *ParseableConfigReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 	}
 
 	// Step 7: Ensure metrics+events collector Deployment
+	if err := validateConfigDropLabelPatterns(config); err != nil {
+		logger.Error(err, "Invalid metrics configuration")
+		if _, statusErr := r.setReadyCondition(ctx, config, metav1.ConditionFalse, "InvalidConfiguration", err.Error()); statusErr != nil {
+			logger.Error(statusErr, "Failed to report invalid configuration")
+			return ctrl.Result{}, statusErr
+		}
+		return ctrl.Result{}, nil
+	}
 	if err := r.ensureMetricsEventsCollector(ctx, config); err != nil {
 		logger.Error(err, "Failed to ensure metrics/events collector")
 		return ctrl.Result{}, err
+	}
+	if _, err := r.setReadyCondition(ctx, config, metav1.ConditionTrue, "Reconciled", "Configuration reconciled successfully"); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to update ready status: %w", err)
 	}
 
 	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
@@ -1044,7 +1057,7 @@ func (r *ParseableConfigReconciler) buildMetricsEventsCollectorConfig(
 								},
 								map[string]interface{}{
 									"source_labels": []interface{}{"__meta_kubernetes_service_port_name"},
-									"regex":         "metrics|http-metrics",
+									"regex":         "metrics|http-metrics|http",
 									"action":        "keep",
 								},
 							},
@@ -1073,6 +1086,9 @@ func (r *ParseableConfigReconciler) buildMetricsEventsCollectorConfig(
 			id := sanitizeName(sc.Name)
 			if id == "" || sc.TargetDataset == "" || sc.Port <= 0 {
 				continue
+			}
+			if err := validateDropLabelPatterns(sc.Name, sc.DropLabels); err != nil {
+				return nil, err
 			}
 			metricsPath := sc.URI
 			if metricsPath == "" {
@@ -2302,6 +2318,58 @@ func isPodReady(pod *corev1.Pod) bool {
 		}
 	}
 	return len(pod.Status.ContainerStatuses) > 0
+}
+
+func validateDropLabelPatterns(scrapeName string, patterns []string) error {
+	for _, pattern := range patterns {
+		if _, err := regexp.Compile(pattern); err != nil {
+			return fmt.Errorf("invalid dropLabels regex %q in scrape config %q: %w", pattern, scrapeName, err)
+		}
+	}
+	return nil
+}
+
+func validateConfigDropLabelPatterns(config *observabilityv1alpha1.ParseableConfig) error {
+	if config.Spec.Metrics == nil {
+		return nil
+	}
+	for _, sc := range config.Spec.Metrics.ScrapeConfigs {
+		if sanitizeName(sc.Name) == "" || sc.TargetDataset == "" || sc.Port <= 0 {
+			continue
+		}
+		if err := validateDropLabelPatterns(sc.Name, sc.DropLabels); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *ParseableConfigReconciler) setReadyCondition(
+	ctx context.Context,
+	config *observabilityv1alpha1.ParseableConfig,
+	status metav1.ConditionStatus,
+	reason, message string,
+) (bool, error) {
+	fresh := &observabilityv1alpha1.ParseableConfig{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(config), fresh); err != nil {
+		return false, err
+	}
+
+	before := append([]metav1.Condition(nil), fresh.Status.Conditions...)
+	apimeta.SetStatusCondition(&fresh.Status.Conditions, metav1.Condition{
+		Type:               "Ready",
+		Status:             status,
+		Reason:             reason,
+		Message:            message,
+		ObservedGeneration: fresh.Generation,
+	})
+	if apiequality.Semantic.DeepEqual(before, fresh.Status.Conditions) {
+		return false, nil
+	}
+	if err := r.Status().Update(ctx, fresh); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.

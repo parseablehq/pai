@@ -235,7 +235,7 @@ type ScrapeConfig struct {
 	// a Prometheus keep-relabel per label and skips the port-number filter.
 	PodSelector map[string]string `json:"podSelector,omitempty"`
 
-	// DropLabels lists metric label names to strip after scraping (emitted as
+	// DropLabels lists metric label name regex patterns to strip after scraping (emitted as
 	// labeldrop metric_relabel_configs). Useful when a label's values would
 	// conflict with an existing column type in the target dataset.
 	DropLabels []string `json:"dropLabels,omitempty"`
