@@ -300,6 +300,12 @@ spec:
                           description: Port is the container port to scrape
                           format: int32
                           type: integer
+                        scrapeIntervalSeconds:
+                          description: |-
+                            ScrapeIntervalSeconds overrides the scrape interval (default 30s).
+                            Raise it for expensive targets, e.g. exporters that call paid cloud APIs.
+                          format: int32
+                          type: integer
                         targetDataset:
                           description: TargetDataset is the Parseable dataset name
                             for this scrape pipeline's metric data

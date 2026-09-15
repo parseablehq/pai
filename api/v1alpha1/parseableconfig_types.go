@@ -234,6 +234,10 @@ type ScrapeConfig struct {
 	// PodSelector selects pods by label key/value pairs. When set, the operator emits
 	// a Prometheus keep-relabel per label and skips the port-number filter.
 	PodSelector map[string]string `json:"podSelector,omitempty"`
+
+	// ScrapeIntervalSeconds overrides the scrape interval (default 30s).
+	// Raise it for expensive targets, e.g. exporters that call paid cloud APIs.
+	ScrapeIntervalSeconds int32 `json:"scrapeIntervalSeconds,omitempty"`
 }
 
 // MetricsConfig defines metrics configuration. ClusterMetrics enables built-in
