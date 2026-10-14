@@ -39,6 +39,160 @@ spec:
           spec:
             description: ParseableConfigSpec defines the desired state of ParseableConfig
             properties:
+              collectorResources:
+                description: CollectorResources sets CPU and memory requests and limits
+                  for each managed collector.
+                properties:
+                  logs:
+                    description: Logs applies to the log and kubeletstats collector
+                      DaemonSet.
+                    properties:
+                      limits:
+                        additionalProperties:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                        description: ResourceList is a set of (resource name, quantity)
+                          pairs.
+                        type: object
+                      requests:
+                        additionalProperties:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                        description: ResourceList is a set of (resource name, quantity)
+                          pairs.
+                        type: object
+                    type: object
+                    x-kubernetes-validations:
+                    - message: CPU request must be non-negative
+                      rule: '!has(self.requests) || !(''cpu'' in self.requests) ||
+                        quantity(string(self.requests[''cpu''])).compareTo(quantity(''0''))
+                        >= 0'
+                    - message: memory request must be non-negative
+                      rule: '!has(self.requests) || !(''memory'' in self.requests)
+                        || quantity(string(self.requests[''memory''])).compareTo(quantity(''0''))
+                        >= 0'
+                    - message: CPU limit must be non-negative
+                      rule: '!has(self.limits) || !(''cpu'' in self.limits) || quantity(string(self.limits[''cpu''])).compareTo(quantity(''0''))
+                        >= 0'
+                    - message: memory limit must be non-negative
+                      rule: '!has(self.limits) || !(''memory'' in self.limits) ||
+                        quantity(string(self.limits[''memory''])).compareTo(quantity(''0''))
+                        >= 0'
+                    - message: CPU request must be less than or equal to CPU limit
+                      rule: '!has(self.requests) || !has(self.limits) || !(''cpu''
+                        in self.requests) || !(''cpu'' in self.limits) || quantity(string(self.requests[''cpu''])).compareTo(quantity(string(self.limits[''cpu''])))
+                        <= 0'
+                    - message: memory request must be less than or equal to memory
+                        limit
+                      rule: '!has(self.requests) || !has(self.limits) || !(''memory''
+                        in self.requests) || !(''memory'' in self.limits) || quantity(string(self.requests[''memory''])).compareTo(quantity(string(self.limits[''memory''])))
+                        <= 0'
+                  metrics:
+                    description: Metrics applies to the shared metrics and Kubernetes
+                      events collector Deployment.
+                    properties:
+                      limits:
+                        additionalProperties:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                        description: ResourceList is a set of (resource name, quantity)
+                          pairs.
+                        type: object
+                      requests:
+                        additionalProperties:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                        description: ResourceList is a set of (resource name, quantity)
+                          pairs.
+                        type: object
+                    type: object
+                    x-kubernetes-validations:
+                    - message: CPU request must be non-negative
+                      rule: '!has(self.requests) || !(''cpu'' in self.requests) ||
+                        quantity(string(self.requests[''cpu''])).compareTo(quantity(''0''))
+                        >= 0'
+                    - message: memory request must be non-negative
+                      rule: '!has(self.requests) || !(''memory'' in self.requests)
+                        || quantity(string(self.requests[''memory''])).compareTo(quantity(''0''))
+                        >= 0'
+                    - message: CPU limit must be non-negative
+                      rule: '!has(self.limits) || !(''cpu'' in self.limits) || quantity(string(self.limits[''cpu''])).compareTo(quantity(''0''))
+                        >= 0'
+                    - message: memory limit must be non-negative
+                      rule: '!has(self.limits) || !(''memory'' in self.limits) ||
+                        quantity(string(self.limits[''memory''])).compareTo(quantity(''0''))
+                        >= 0'
+                    - message: CPU request must be less than or equal to CPU limit
+                      rule: '!has(self.requests) || !has(self.limits) || !(''cpu''
+                        in self.requests) || !(''cpu'' in self.limits) || quantity(string(self.requests[''cpu''])).compareTo(quantity(string(self.limits[''cpu''])))
+                        <= 0'
+                    - message: memory request must be less than or equal to memory
+                        limit
+                      rule: '!has(self.requests) || !has(self.limits) || !(''memory''
+                        in self.requests) || !(''memory'' in self.limits) || quantity(string(self.requests[''memory''])).compareTo(quantity(string(self.limits[''memory''])))
+                        <= 0'
+                  traces:
+                    description: Traces applies to the trace collector Deployment.
+                    properties:
+                      limits:
+                        additionalProperties:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                        description: ResourceList is a set of (resource name, quantity)
+                          pairs.
+                        type: object
+                      requests:
+                        additionalProperties:
+                          anyOf:
+                          - type: integer
+                          - type: string
+                          pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                          x-kubernetes-int-or-string: true
+                        description: ResourceList is a set of (resource name, quantity)
+                          pairs.
+                        type: object
+                    type: object
+                    x-kubernetes-validations:
+                    - message: CPU request must be non-negative
+                      rule: '!has(self.requests) || !(''cpu'' in self.requests) ||
+                        quantity(string(self.requests[''cpu''])).compareTo(quantity(''0''))
+                        >= 0'
+                    - message: memory request must be non-negative
+                      rule: '!has(self.requests) || !(''memory'' in self.requests)
+                        || quantity(string(self.requests[''memory''])).compareTo(quantity(''0''))
+                        >= 0'
+                    - message: CPU limit must be non-negative
+                      rule: '!has(self.limits) || !(''cpu'' in self.limits) || quantity(string(self.limits[''cpu''])).compareTo(quantity(''0''))
+                        >= 0'
+                    - message: memory limit must be non-negative
+                      rule: '!has(self.limits) || !(''memory'' in self.limits) ||
+                        quantity(string(self.limits[''memory''])).compareTo(quantity(''0''))
+                        >= 0'
+                    - message: CPU request must be less than or equal to CPU limit
+                      rule: '!has(self.requests) || !has(self.limits) || !(''cpu''
+                        in self.requests) || !(''cpu'' in self.limits) || quantity(string(self.requests[''cpu''])).compareTo(quantity(string(self.limits[''cpu''])))
+                        <= 0'
+                    - message: memory request must be less than or equal to memory
+                        limit
+                      rule: '!has(self.requests) || !has(self.limits) || !(''memory''
+                        in self.requests) || !(''memory'' in self.limits) || quantity(string(self.requests[''memory''])).compareTo(quantity(string(self.limits[''memory''])))
+                        <= 0'
+                type: object
               events:
                 description: Events defines Kubernetes events collection configuration
                 properties:

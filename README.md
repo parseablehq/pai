@@ -177,6 +177,29 @@ Once the `ParseableConfig` CR is applied, PAI automatically creates the followin
 - **Application Prometheus metrics** via `spec.metrics.scrapeConfigs`
 - Namespace filtering applies to pod-scoped metrics; node-scoped metrics are not filtered
 
+### Collector CPU and memory
+
+Set `spec.collectorResources` to give each managed collector its own Kubernetes
+CPU and memory requests and limits. `traces` applies to the trace Deployment,
+`logs` to the log DaemonSet, and `metrics` to the shared metrics
+and Kubernetes events Deployment. Omitted entries retain the OpenTelemetry Operator's resource defaults. 
+
+For example:
+
+```yaml
+spec:
+  collectorResources:
+    traces:
+      requests: {cpu: 100m, memory: 128Mi}
+      limits: {cpu: 500m, memory: 512Mi}
+    logs:
+      requests: {cpu: 100m, memory: 128Mi}
+      limits: {cpu: 500m, memory: 512Mi}
+    metrics:
+      requests: {cpu: 200m, memory: 256Mi}
+      limits: {cpu: "1", memory: 1Gi}
+```
+
 ### Events
 - Kubernetes events collected via `k8sobjects` receiver in watch mode
 - Namespace filtering via `namespaceSelector`

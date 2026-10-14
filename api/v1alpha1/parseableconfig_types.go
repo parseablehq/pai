@@ -17,6 +17,7 @@ limitations under the License.
 package v1alpha1
 
 import (
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -261,6 +262,31 @@ type EventsConfig struct {
 	NamespaceSelector NamespaceSelector `json:"namespaceSelector,omitempty"`
 }
 
+// CollectorResourceRequirements sets CPU and memory requests and limits for one
+// OpenTelemetryCollector workload.
+// +kubebuilder:validation:XValidation:rule="!has(self.requests) || !('cpu' in self.requests) || quantity(string(self.requests['cpu'])).compareTo(quantity('0')) >= 0",message="CPU request must be non-negative"
+// +kubebuilder:validation:XValidation:rule="!has(self.requests) || !('memory' in self.requests) || quantity(string(self.requests['memory'])).compareTo(quantity('0')) >= 0",message="memory request must be non-negative"
+// +kubebuilder:validation:XValidation:rule="!has(self.limits) || !('cpu' in self.limits) || quantity(string(self.limits['cpu'])).compareTo(quantity('0')) >= 0",message="CPU limit must be non-negative"
+// +kubebuilder:validation:XValidation:rule="!has(self.limits) || !('memory' in self.limits) || quantity(string(self.limits['memory'])).compareTo(quantity('0')) >= 0",message="memory limit must be non-negative"
+// +kubebuilder:validation:XValidation:rule="!has(self.requests) || !has(self.limits) || !('cpu' in self.requests) || !('cpu' in self.limits) || quantity(string(self.requests['cpu'])).compareTo(quantity(string(self.limits['cpu']))) <= 0",message="CPU request must be less than or equal to CPU limit"
+// +kubebuilder:validation:XValidation:rule="!has(self.requests) || !has(self.limits) || !('memory' in self.requests) || !('memory' in self.limits) || quantity(string(self.requests['memory'])).compareTo(quantity(string(self.limits['memory']))) <= 0",message="memory request must be less than or equal to memory limit"
+type CollectorResourceRequirements struct {
+	Requests corev1.ResourceList `json:"requests,omitempty"`
+	Limits   corev1.ResourceList `json:"limits,omitempty"`
+}
+
+// CollectorResourcesConfig configures the three collectors managed by PAI.
+type CollectorResourcesConfig struct {
+	// Traces applies to the trace collector Deployment.
+	Traces *CollectorResourceRequirements `json:"traces,omitempty"`
+
+	// Logs applies to the log and kubeletstats collector DaemonSet.
+	Logs *CollectorResourceRequirements `json:"logs,omitempty"`
+
+	// Metrics applies to the shared metrics and Kubernetes events collector Deployment.
+	Metrics *CollectorResourceRequirements `json:"metrics,omitempty"`
+}
+
 // ParseableConfigSpec defines the desired state of ParseableConfig
 type ParseableConfigSpec struct {
 	// Paused stops all data collection when set to true.
@@ -269,6 +295,9 @@ type ParseableConfigSpec struct {
 
 	// Target defines the global Parseable endpoint and credentials
 	Target TargetConfig `json:"target"`
+
+	// CollectorResources sets CPU and memory requests and limits for each managed collector.
+	CollectorResources *CollectorResourcesConfig `json:"collectorResources,omitempty"`
 
 	// Traces defines tracing configuration
 	Traces *TracesConfig `json:"traces,omitempty"`

@@ -12,6 +12,17 @@ spec:
       name: parseable-creds
       namespace: parseable-operator-system
 
+  collectorResources:
+    traces:
+      requests: {cpu: 100m, memory: 128Mi}
+      limits: {cpu: 500m, memory: 512Mi}
+    logs:
+      requests: {cpu: 100m, memory: 128Mi}
+      limits: {cpu: 500m, memory: 512Mi}
+    metrics:
+      requests: {cpu: 200m, memory: 256Mi}
+      limits: {cpu: "1", memory: 1Gi}
+
   traces:
     targetDataset: pai-traces-ds
     namespaceSelector:

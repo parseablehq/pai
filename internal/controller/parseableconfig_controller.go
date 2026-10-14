@@ -264,9 +264,18 @@ func (r *ParseableConfigReconciler) ensureTraceCollector(ctx context.Context, co
 		"replicas": int64(1),
 		"config":   collectorConfig,
 	}
+	if config.Spec.CollectorResources != nil {
+		setCollectorResources(spec, config.Spec.CollectorResources.Traces)
+	}
 
 	if err == nil {
-		if apiequality.Semantic.DeepDerivative(spec, existing.Object["spec"]) {
+		existingSpec, _ := existing.Object["spec"].(map[string]interface{})
+		existingResources := existingSpec["resources"]
+		if empty, ok := existingResources.(map[string]interface{}); ok && len(empty) == 0 {
+			existingResources = nil
+		}
+		if apiequality.Semantic.DeepDerivative(spec, existing.Object["spec"]) &&
+			apiequality.Semantic.DeepEqual(spec["resources"], existingResources) {
 			return nil
 		}
 		existing.Object["spec"] = spec
@@ -646,6 +655,9 @@ func (r *ParseableConfigReconciler) ensureLogCollector(ctx context.Context, conf
 			map[string]interface{}{"operator": "Exists"},
 		},
 	}
+	if config.Spec.CollectorResources != nil {
+		setCollectorResources(spec, config.Spec.CollectorResources.Logs)
+	}
 	if len(volumes) > 0 {
 		spec["volumes"] = volumes
 		spec["volumeMounts"] = volumeMounts
@@ -922,6 +934,9 @@ func (r *ParseableConfigReconciler) ensureMetricsEventsCollector(ctx context.Con
 		"tolerations": []interface{}{
 			map[string]interface{}{"operator": "Exists"},
 		},
+	}
+	if config.Spec.CollectorResources != nil {
+		setCollectorResources(spec, config.Spec.CollectorResources.Metrics)
 	}
 
 	if err == nil {

@@ -37,6 +37,9 @@ metadata:
   namespace: otel-operator
 spec:
   mode: deployment
+  resources:
+    requests: {cpu: 200m, memory: 256Mi}
+    limits: {cpu: "1", memory: 1Gi}
   config:
     receivers:
       # Cluster-level object state (deployments, pods, nodes, etc.)
