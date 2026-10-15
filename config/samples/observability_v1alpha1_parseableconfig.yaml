@@ -12,6 +12,10 @@ spec:
       name: parseable-creds
       namespace: parseable-operator-system
 
+  # Optional: export log and metrics collectors' own metrics to this Parseable dataset.
+  # selfMonitoring:
+  #   targetDataset: pai-collector-health
+
   traces:
     targetDataset: pai-traces-ds
     namespaceSelector:

@@ -664,6 +664,9 @@ func (r *ParseableConfigReconciler) ensureLogCollector(ctx context.Context, conf
 			},
 		}
 	}
+	if selfMonitoringEnabled(config) {
+		addSelfMonitoringPodEnv(spec)
+	}
 
 	if err == nil {
 		// Update existing
@@ -859,14 +862,16 @@ func (r *ParseableConfigReconciler) buildLogCollectorConfig(ctx context.Context,
 		}
 	}
 
-	return map[string]interface{}{
+	collectorConfig := map[string]interface{}{
 		"receivers":  receivers,
 		"processors": processors,
 		"exporters":  exporters,
 		"service": map[string]interface{}{
 			"pipelines": pipelines,
 		},
-	}, nil
+	}
+	r.addSelfMonitoringPipeline(collectorConfig, config, authKey, authValue, logCollectorName)
+	return collectorConfig, nil
 }
 
 // ensureMetricsEventsCollector creates or updates a single Deployment-mode OpenTelemetryCollector CR
@@ -922,6 +927,9 @@ func (r *ParseableConfigReconciler) ensureMetricsEventsCollector(ctx context.Con
 		"tolerations": []interface{}{
 			map[string]interface{}{"operator": "Exists"},
 		},
+	}
+	if selfMonitoringEnabled(config) && metricsEnabled {
+		addSelfMonitoringPodEnv(spec)
 	}
 
 	if err == nil {
@@ -1210,6 +1218,9 @@ func (r *ParseableConfigReconciler) buildMetricsEventsCollectorConfig(
 		},
 	}
 
+	if metricsEnabled {
+		r.addSelfMonitoringPipeline(collectorConfig, config, authKey, authValue, metricsEventsCollectorName)
+	}
 	return collectorConfig, nil
 }
 

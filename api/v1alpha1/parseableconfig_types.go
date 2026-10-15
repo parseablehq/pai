@@ -261,6 +261,16 @@ type EventsConfig struct {
 	NamespaceSelector NamespaceSelector `json:"namespaceSelector,omitempty"`
 }
 
+// SelfMonitoringConfig sends log and metrics collectors' own metrics to Parseable.
+type SelfMonitoringConfig struct {
+	// TargetDataset is the Parseable dataset for collector self-metrics.
+	// +kubebuilder:validation:MinLength=1
+	TargetDataset string `json:"targetDataset"`
+
+	// Headers are additional HTTP headers for the self-metrics exporter.
+	Headers map[string]string `json:"headers,omitempty"`
+}
+
 // ParseableConfigSpec defines the desired state of ParseableConfig
 type ParseableConfigSpec struct {
 	// Paused stops all data collection when set to true.
@@ -269,6 +279,10 @@ type ParseableConfigSpec struct {
 
 	// Target defines the global Parseable endpoint and credentials
 	Target TargetConfig `json:"target"`
+
+	// SelfMonitoring sends log and metrics collectors' own metrics to the configured dataset.
+	// Omit this field to leave self-monitoring disabled.
+	SelfMonitoring *SelfMonitoringConfig `json:"selfMonitoring,omitempty"`
 
 	// Traces defines tracing configuration
 	Traces *TracesConfig `json:"traces,omitempty"`

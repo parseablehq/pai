@@ -321,6 +321,25 @@ spec:
                   Paused stops all data collection when set to true.
                   Collectors, instrumentation, and agent are deleted. Set to false to resume.
                 type: boolean
+              selfMonitoring:
+                description: |-
+                  SelfMonitoring sends log and metrics collectors' own metrics to the configured dataset.
+                  Omit this field to leave self-monitoring disabled.
+                properties:
+                  headers:
+                    additionalProperties:
+                      type: string
+                    description: Headers are additional HTTP headers for the self-metrics
+                      exporter.
+                    type: object
+                  targetDataset:
+                    description: TargetDataset is the Parseable dataset for collector
+                      self-metrics.
+                    minLength: 1
+                    type: string
+                required:
+                - targetDataset
+                type: object
               target:
                 description: Target defines the global Parseable endpoint and credentials
                 properties:

@@ -177,6 +177,26 @@ Once the `ParseableConfig` CR is applied, PAI automatically creates the followin
 - **Application Prometheus metrics** via `spec.metrics.scrapeConfigs`
 - Namespace filtering applies to pod-scoped metrics; node-scoped metrics are not filtered
 
+### Collector self-monitoring
+
+Set `spec.selfMonitoring.targetDataset` to send the log and metrics collectors' own metrics
+to a Parseable dataset. If `selfMonitoring` is omitted, no self-metrics pipeline is
+created. The log DaemonSet pods and shared metrics/events Deployment (when metrics are
+enabled) each scrape their local `:8888/metrics` endpoint every 15 seconds. The metrics
+use the target credentials and encoding; `pai_collector` and `pai_pod` labels identify
+the source.
+
+```yaml
+spec:
+  selfMonitoring:
+    targetDataset: pai-collector-health
+    # headers:
+    #   X-P-Environment: production
+```
+
+This option monitors log and metrics collectors that already exist for enabled signals;
+it does not create a collector when logs and metrics are disabled.
+
 ### Events
 - Kubernetes events collected via `k8sobjects` receiver in watch mode
 - Namespace filtering via `namespaceSelector`
